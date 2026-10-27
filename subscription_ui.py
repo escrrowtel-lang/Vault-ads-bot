@@ -408,4 +408,149 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not _is_admin(q.from_user):
         return await q.answer("⛔ Admin only", show_alert=True)
-    if not q.message or q.message.chat.type != "private
+    if not q.message or q.message.chat.type != "private":
+        return await q.answer()
+    if not S.STORE:
+        return await q.answer("Subscription service is not running (check logs).", show_alert=True)
+    parts = q.data.split(":")
+    a = parts[1] if len(parts) > 1 else "home"
+    actor = q.from_user.id
+    try:
+        await q.answer()
+        if a in ("home", "cancel"):
+            ctx.user_data.pop("sadm", None)
+            return await _edit(q, *await dash_view())
+        if a == "plans":
+            ctx.user_data.pop("sadm", None)
+            return await _edit(q, *await plans_view())
+        if a == "pl":
+            return await _edit(q, *await plan_view(parts[2]))
+        if a == "pnew":
+            return await _edit(q, *_prompt(ctx, "pnew_name", "➕ <b>NEW PLAN</b>\n\nSend the plan name (2–40 characters):"))
+        if a == "pe":
+            field = parts[3]
+            ask = {"name": "Send the new plan name:", "price": "Send the new price in rupees (e.g. 199):",
+                   "days": "Send the new duration in days (e.g. 30):"}[field]
+            return await _edit(q, *_prompt(ctx, "pedit_" + field, "✏️ " + ask, pid=parts[2]))
+        if a == "pt":
+            p = await S.run(S.STORE.get_plan, parts[2])
+            if p:
+                await S.run(S.STORE.update_plan, parts[2], enabled=not p["enabled"])
+                await S.run(S.STORE.audit, f"admin:{actor}", "plan_toggle", parts[2], {"enabled": not p["enabled"]})
+            return await _edit(q, *await plan_view(parts[2]))
+        if a == "pay":
+            return await _edit(q, *await payments_view(parts[2], int(parts[3])))
+        if a == "pd":
+            return await _edit(q, *await payment_admin_view(parts[2]))
+        if a == "pr":
+            doc = await S.run(S.STORE.get_payment, parts[2])
+            note = "ℹ️ Nothing to re-verify."
+            if doc:
+                try:
+                    await S.refresh_payment(parts[2])
+                    note = "🔄 Re-verified with Razorpay."
+                    await S.run(S.STORE.audit, f"admin:{actor}", "payment_reverify", parts[2])
+                except Exception as e:
+                    note = f"⚠️ Re-verify failed: {h(e)}"
+            return await _edit(q, *await payment_admin_view(parts[2], note))
+        if a == "subs":
+            return await _edit(q, *await subs_view(parts[2], int(parts[3])))
+        if a == "su":
+            return await _edit(q, *await user_admin_view(int(parts[2])))
+        if a == "users":
+            return await _edit(q, *await approved_users_view())
+        if a == "find":
+            return await _edit(q, *_prompt(ctx, "find", "🔎 <b>FIND USER</b>\n\nSend the Telegram user ID:"))
+        if a == "sx":
+            return await _edit(q, *_prompt(ctx, "extend", f"➕ <b>EXTEND / GRANT</b> for <code>{int(parts[2])}</code>\n\n"
+                                           "Send number of days to add. Access is removed automatically when the period ends.",
+                                           uid=int(parts[2])))
+        if a == "sv":
+            uid = int(parts[2])
+            return await _edit(q, f"🚫 Revoke subscription of <code>{uid}</code>?\n\nTheir bot access is removed immediately.",
+                               [[B("✅ Yes, revoke", f"sadm:svy:{uid}")], [B("❌ Cancel", f"sadm:su:{uid}")]])
+        if a == "svy":
+            uid = int(parts[2])
+            done = await S.admin_revoke(uid, actor)
+            return await _edit(q, *await user_admin_view(uid, "🚫 Subscription revoked." if done else "ℹ️ No active subscription."))
+        if a == "exp":
+            return await _edit(q, *await expiry_view())
+        if a == "sweep":
+            await S.expiry_sweep()
+            await S.run(S.STORE.audit, f"admin:{actor}", "manual_sweep", "all")
+            return await _edit(q, *await expiry_view("✅ Expiry sweep completed."))
+        if a == "audit":
+            return await _edit(q, *await audit_view(int(parts[2])))
+    except Exception:
+        log.exception("sadm_callback error")
+        try:
+            await q.answer("Error — see logs.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Text input for admin flows. Consumes the message only while a flow is active."""
+    user = update.effective_user
+    msg = update.message
+    if not _is_admin(user) or not msg or not S.STORE:
+        return
+    st = ctx.user_data.get("sadm")
+    if not st:
+        return
+    if time.time() - st["ts"] > STATE_TTL:
+        ctx.user_data.pop("sadm", None)
+        return
+    txt = (msg.text or "").strip()
+    act = st["act"]
+    actor = user.id
+    try:
+        if act == "pnew_name":
+            st.update(name=S.parse_name(txt), act="pnew_price", ts=time.time())
+            text, rows = "💰 Send the price in rupees (e.g. 199):", [[B("❌ Cancel", "sadm:cancel")]]
+        elif act == "pnew_price":
+            st.update(price=S.parse_price_paise(txt), act="pnew_days", ts=time.time())
+            text, rows = "⏳ Send the duration in days (e.g. 30):", [[B("❌ Cancel", "sadm:cancel")]]
+        elif act == "pnew_days":
+            plan = await S.run(S.STORE.create_plan, st["name"], st["price"], S.parse_days(txt))
+            ctx.user_data.pop("sadm", None)
+            await S.run(S.STORE.audit, f"admin:{actor}", "plan_create", plan["plan_id"], {"name": plan["name"]})
+            text, rows = await plan_view(plan["plan_id"], "✅ Plan created and enabled.")
+        elif act.startswith("pedit_"):
+            field = act[6:]
+            val = {"name": S.parse_name, "price": S.parse_price_paise, "days": S.parse_days}[field](txt)
+            key = {"name": "name", "price": "price_paise", "days": "duration_days"}[field]
+            await S.run(S.STORE.update_plan, st["pid"], **{key: val})
+            ctx.user_data.pop("sadm", None)
+            await S.run(S.STORE.audit, f"admin:{actor}", "plan_edit", st["pid"], {field: val})
+            text, rows = await plan_view(st["pid"], "✅ Plan updated.")
+        elif act == "find":
+            if not txt.isdigit() or int(txt) <= 0:
+                raise ValueError("Send a numeric Telegram user ID.")
+            ctx.user_data.pop("sadm", None)
+            text, rows = await user_admin_view(int(txt))
+        elif act == "extend":
+            days = S.parse_days(txt)
+            ctx.user_data.pop("sadm", None)
+            await S.admin_extend(st["uid"], days, actor)
+            text, rows = await user_admin_view(st["uid"], f"✅ Added {days} day(s).")
+        else:
+            ctx.user_data.pop("sadm", None)
+            return
+    except ValueError as e:
+        text, rows = f"❌ {h(e)}\n\nTry again or tap Cancel.", [[B("❌ Cancel", "sadm:cancel")]]
+    except Exception:
+        log.exception("sadm_text error")
+        ctx.user_data.pop("sadm", None)
+        text, rows = "❌ Something went wrong. See the logs.", [[B("⬅️ Back", "sadm:home")]]
+    await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows),
+                         disable_web_page_preview=True)
+    raise ApplicationHandlerStop
+
+
+def register_handlers(app):
+    # group=-1 handlers only act for their own cases and otherwise let the existing handlers run unchanged.
+    app.add_handler(CommandHandler("start", start_gate, filters=filters.ChatType.PRIVATE), group=-1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, sadm_text), group=-1)
+    app.add_handler(CallbackQueryHandler(sub_callback, pattern=r"^sub:"))
+    app.add_handler(CallbackQueryHandler(sadm_callback, pattern=r"^sadm:"))
