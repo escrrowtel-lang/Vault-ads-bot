@@ -42,7 +42,8 @@ API_HASH = os.environ["API_HASH"]
 MONGO_URI = os.environ["MONGO_URI"]
 MONGO_DB = os.getenv("MONGO_DB", "promo_bot")
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
-DEFAULT_INTERVAL_MINUTES = int(os.getenv("DEFAULT_INTERVAL_MINUTES", "60"))
+MIN_AD_INTERVAL_MINUTES = 10
+DEFAULT_INTERVAL_MINUTES = max(MIN_AD_INTERVAL_MINUTES, int(os.getenv("DEFAULT_INTERVAL_MINUTES", "60")))
 GROUP_DELAY_SECONDS = max(15, int(os.getenv("GROUP_DELAY_SECONDS", "30")))
 DM_BROADCAST_DELAY_SECONDS = max(30, int(os.getenv("DM_BROADCAST_DELAY_SECONDS", "60")))
 DM_REPLY_SEND_GAP_SECONDS = max(2, int(os.getenv("DM_REPLY_SEND_GAP_SECONDS", "5")))
@@ -117,6 +118,7 @@ PROMOTION_MENU = ReplyKeyboardMarkup(
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["⏱ Interval", "⏳ Group Delay"],
         ["🔄 Rescan Targets", "📨 DM Broadcast"],
+        ["📅 Schedule"],
         ["⬅️ Back"],
     ],
     resize_keyboard=True,
@@ -1088,6 +1090,36 @@ def fmt_duration(sec: float) -> str:
     return f"{s}s"
 
 
+async def schedule_text() -> str:
+    """Ad schedule overview built from existing settings and live round state."""
+    interval = await get_ad_interval_minutes()
+    delay = await get_group_delay()
+    mode = await db.get_setting("post_mode", "rotate")
+    active_posts = len(await db.list_posts(enabled_only=True))
+    accounts = len(await session_store.get_sessions(enabled_only=True))
+    if stats.running:
+        status = "🟢 Running"
+        next_run = fmt_duration(stats.next_round_at - time.time()) if stats.next_round_at else "-"
+        current = stats.current_post if stats.current_post not in ("", "-") else "-"
+    else:
+        status = "🔴 Stopped"
+        next_run = "-"
+        current = "-"
+    return (
+        "📅 <b>AD SCHEDULE</b>\n\n"
+        f"Status: <b>{status}</b>\n"
+        f"⏱ Interval: <b>{interval} min</b> (minimum {MIN_AD_INTERVAL_MINUTES})\n"
+        f"⏳ Gap between groups: <b>{delay}s</b>\n"
+        f"📝 Ads: <b>{active_posts}</b> enabled | Mode: <b>{esc(mode.title())}</b>\n"
+        f"📮 Current ad: <b>{esc(current)}</b>\n"
+        f"👤 Active accounts: <b>{accounts}</b>\n"
+        f"👥 Groups in last round: <b>{stats.total_groups}</b> (each account posts to the groups it has joined)\n"
+        f"🔁 Next round in: <b>{next_run}</b>\n\n"
+        "Start/Stop: ▶️ Start Promo / ⏹ Stop Promo\n"
+        "Change interval: ⏱ Interval"
+    )
+
+
 def stats_text() -> str:
     total_targets = stats.total_groups + stats.total_users
     pct = (stats.attempted / total_targets * 100) if total_targets else 0
@@ -1449,6 +1481,15 @@ async def get_cached_targets(row: dict, client: TelegramClient, force: bool = Fa
         stats.cached_group_count[row["id"]] = len(groups)
         stats.cached_user_count[row["id"]] = len(users)
         return groups, users, True
+
+
+async def get_ad_interval_minutes() -> int:
+    """Effective ad interval: stored value, never below MIN_AD_INTERVAL_MINUTES."""
+    try:
+        stored = int(await db.get_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES)))
+    except (ValueError, TypeError):
+        stored = DEFAULT_INTERVAL_MINUTES
+    return max(MIN_AD_INTERVAL_MINUTES, stored)
 
 
 async def get_group_delay() -> int:
@@ -2101,8 +2142,7 @@ async def scheduler(app: Application):
 
             if not stats.running:
                 break
-            interval = int(await db.get_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES)))
-            interval = max(5, interval)
+            interval = await get_ad_interval_minutes()
             stats.next_round_at = time.time() + interval * 60
             # A session that was already paused when the round started should
             # not wait an extra full promotion interval after its FloodWait ends.
@@ -3006,12 +3046,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.pop(uid, None)
         try:
             minutes = int(text.strip())
-            if minutes < 5:
+            if minutes < MIN_AD_INTERVAL_MINUTES:
                 raise ValueError
             await db.set_setting("interval_minutes", str(minutes))
             await update.message.reply_text(f"✅ Interval set to {minutes} minutes.", reply_markup=MENU)
         except ValueError:
-            await update.message.reply_text("❌ Send a whole number of minutes (minimum 5).", reply_markup=MENU)
+            await update.message.reply_text(f"❌ Send a whole number of minutes (minimum {MIN_AD_INTERVAL_MINUTES}).", reply_markup=MENU)
         return
 
     if current == "await_remove":
@@ -3284,10 +3324,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text == "⏱ Interval":
-        current_interval = await db.get_setting("interval_minutes", str(DEFAULT_INTERVAL_MINUTES))
+        current_interval = await get_ad_interval_minutes()
         state[uid] = "await_interval"
         await update.message.reply_text(
-            f"Current interval: {current_interval} min.\n\nSend new interval in minutes (minimum 5).",
+            f"Current interval: {current_interval} min.\n\nSend new interval in minutes (minimum {MIN_AD_INTERVAL_MINUTES}).",
             reply_markup=MENU,
         )
 
@@ -3392,6 +3432,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text == "📜 Account Logs":
         await send_account_telemetry(update, 'logs')
+
+    elif text == "📅 Schedule":
+        await update.message.reply_text(await schedule_text(), parse_mode=ParseMode.HTML, reply_markup=PROMOTION_MENU)
 
     elif text == "📊 Live Stats":
         stats.active_posts = len(await db.list_posts(enabled_only=True))
