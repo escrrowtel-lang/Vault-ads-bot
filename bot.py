@@ -107,7 +107,7 @@ MENU = ReplyKeyboardMarkup(
     [
         ["📣 Promotion"],
         ["📝 Posts", "👥 Accounts"],
-        ["💬 Auto Reply", "✏️ Edit/Set Bio"],
+        ["🤖 Auto Reply", "✏️ Edit Bio"],
         ["📊 Monitoring"],
     ],
     resize_keyboard=True,
@@ -2463,7 +2463,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.pop(uid, None)
         await update.message.reply_text("📊 <b>MONITORING</b>", parse_mode=ParseMode.HTML, reply_markup=MONITORING_MENU)
         return
-    if text == "✏️ Edit/Set Bio":
+    if text == "✏️ Edit Bio":
         state.pop(uid, None)
         context.user_data.pop("bio_kind", None)
         context.user_data.pop("bio_mode", None)
@@ -2544,7 +2544,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if not kind or mode not in {"one", "all"}:
             state.pop(uid, None)
-            await update.message.reply_text("Bio flow expired. Open ✏️ Edit/Set Bio again.", reply_markup=MENU)
+            await update.message.reply_text("Bio flow expired. Open ✏️ Edit Bio again.", reply_markup=MENU)
             return
 
         results = []
@@ -2623,7 +2623,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Cooldown updated.\n\n" + await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
         return
 
-    if text == "💬 Auto Reply":
+    if text == "🤖 Auto Reply":
         state.pop(uid, None)
         await update.message.reply_text(await reply_panel_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
         return
