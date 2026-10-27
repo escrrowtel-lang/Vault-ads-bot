@@ -120,6 +120,9 @@ class Store:
         self.audit_log = d["sub_audit_log"]
         self.events = d["sub_webhook_events"]
         self.counters = d["sub_counters"]
+        self.users = d["bot_users"]
+        self.settings = d["bot_settings"]
+        self.broadcasts = d["broadcasts"]
 
     def init(self):
         self.client.admin.command("ping")
@@ -135,6 +138,9 @@ class Store:
         self.subs.create_index([("owner_id", ASCENDING), ("status", ASCENDING), ("expires_at", ASCENDING)])
         self.audit_log.create_index([("owner_id", ASCENDING), ("created_at", DESCENDING)])
         self.events.create_index([("created_at", ASCENDING)], expireAfterSeconds=30 * 86400)
+        self.payments.create_index([("owner_id", ASCENDING), ("qr_id", ASCENDING)], unique=True,
+                                   partialFilterExpression={"qr_id": {"$type": "string"}})
+        self.users.create_index([("owner_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
 
     def close(self):
         self.client.close()
@@ -180,6 +186,49 @@ class Store:
 
     def get_payment_by_link(self, link_id):
         return self.payments.find_one({"owner_id": self.owner_id, "link_id": link_id})
+
+    def get_payment_by_qr(self, qr_id):
+        return self.payments.find_one({"owner_id": self.owner_id, "qr_id": qr_id})
+
+    def set_qr(self, ref, qr_id, image_url, close_by):
+        """Attach a UPI QR to a still-open payment. Only the first QR per payment is kept."""
+        return self.payments.find_one_and_update(
+            {"_id": ref, "owner_id": self.owner_id, "status": "created", "qr_id": None},
+            {"$set": {"qr_id": qr_id, "qr_image_url": image_url, "qr_close_by": close_by, "updated_at": now_utc()}},
+            return_document=ReturnDocument.AFTER)
+
+    # ---- bot users (registered on /start) for broadcast
+    def touch_user(self, uid, name):
+        self.users.update_one(
+            {"owner_id": self.owner_id, "user_id": int(uid)},
+            {"$set": {"name": (name or "")[:64], "last_seen": now_utc(), "blocked": False},
+             "$setOnInsert": {"first_seen": now_utc()}}, upsert=True)
+
+    def recipients(self):
+        return [d["user_id"] for d in self.users.find({"owner_id": self.owner_id, "blocked": {"$ne": True}},
+                                                      {"user_id": 1}).sort("user_id", ASCENDING)]
+
+    def count_users(self):
+        return self.users.count_documents({"owner_id": self.owner_id, "blocked": {"$ne": True}})
+
+    def mark_blocked(self, uid):
+        self.users.update_one({"owner_id": self.owner_id, "user_id": int(uid)}, {"$set": {"blocked": True}})
+
+    def log_broadcast(self, doc):
+        doc["owner_id"] = self.owner_id
+        self.broadcasts.insert_one(doc)
+
+    # ---- editable bot texts
+    def get_setting(self, key):
+        d = self.settings.find_one({"_id": f"{self.owner_id}:{key}"})
+        return d["value"] if d else None
+
+    def set_setting(self, key, value):
+        self.settings.replace_one({"_id": f"{self.owner_id}:{key}"},
+                                  {"_id": f"{self.owner_id}:{key}", "value": value, "updated_at": now_utc()}, upsert=True)
+
+    def del_setting(self, key):
+        self.settings.delete_one({"_id": f"{self.owner_id}:{key}"})
 
     def find_open_payment(self, user_id, plan_id, amount_paise):
         return self.payments.find_one(
@@ -582,7 +631,89 @@ async def refresh_payment(ref: str):
         await activate(ref)
     elif doc and doc["status"] in ("created", "expired", "cancelled") and doc.get("link_id"):
         await process_link(doc["link_id"])
+    doc = await run(STORE.get_payment, ref)
+    if doc and doc["status"] == "created" and doc.get("qr_id"):
+        await process_qr(doc["qr_id"])
     return await run(STORE.get_payment, ref)
+
+
+# ----------------------------------------------------------------- UPI QR (same Razorpay account)
+QR_MAX_SECONDS = 2 * 3600          # Razorpay caps close_by for single_use QR codes at 2 hours
+QR_MIN_SECONDS = 180
+
+
+async def create_qr(ref: str):
+    """Create (once) a single-use, fixed-amount UPI QR for an open payment. Amount comes from the stored payment."""
+    doc = await run(STORE.get_payment, ref)
+    if not doc:
+        raise RuntimeError("Payment not found.")
+    if doc.get("qr_id") and doc.get("qr_image_url"):
+        return doc
+    if doc["status"] != "created":
+        raise RuntimeError("This payment is no longer open.")
+    now = now_utc()
+    close_ts = int(min(doc["link_expires_at"].timestamp() if doc.get("link_expires_at") else now.timestamp() + QR_MAX_SECONDS,
+                       now.timestamp() + QR_MAX_SECONDS))
+    if close_ts - now.timestamp() < QR_MIN_SECONDS:
+        raise RuntimeError("This payment is about to expire. Please start a new payment.")
+    body = {"type": "upi_qr", "usage": "single_use", "fixed_amount": True,
+            "payment_amount": int(doc["amount_paise"]), "name": f"{doc['plan_name']}"[:40],
+            "description": f"{doc['duration_days']} days access"[:255], "close_by": close_ts,
+            "notes": {"payment_ref": ref, "telegram_user_id": str(doc["user_id"])}}
+    try:
+        qr = await _rz("POST", "/payments/qr_codes", body)
+    except Exception as e:
+        log.warning("UPI QR creation failed for %s: %s", ref, e)
+        raise RuntimeError("UPI QR is not available right now. Please use the payment link instead.")
+    updated = await run(STORE.set_qr, ref, qr["id"], qr.get("image_url"), close_ts)
+    if not updated:
+        return await run(STORE.get_payment, ref)
+    await run(STORE.audit, f"user:{doc['user_id']}", "qr_created", ref, {"qr_id": qr["id"]})
+    return updated
+
+
+async def process_qr(qr_id: str, hint_payment_id: str | None = None) -> str:
+    """Server-side verification for a UPI QR: re-fetch the QR and its captured payments from Razorpay, then activate."""
+    doc = await run(STORE.get_payment_by_qr, qr_id)
+    if not doc:
+        return "unknown"
+    if doc["status"] == "paid":
+        await activate(doc["_id"])
+        return "paid"
+    if doc["status"] not in ("created", "expired", "cancelled"):
+        return "pending"
+    ref, amount = doc["_id"], int(doc["amount_paise"])
+    remote = await _rz("GET", f"/payments/qr_codes/{qr_id}")
+    if int(remote.get("payments_count_received") or 0) < 1:
+        return "pending"
+    if int(remote.get("payments_amount_received") or 0) != amount:
+        await run(STORE.set_status, ref, ["created", "expired", "cancelled"], "review",
+                  last_failure="QR amount mismatch")
+        await run(STORE.audit, "system", "payment_mismatch", ref, {"qr_amount_received": remote.get("payments_amount_received")})
+        log.error("QR payment %s flagged for review: amount mismatch", ref)
+        return "review"
+    pays = await _rz("GET", f"/payments/qr_codes/{qr_id}/payments", None)
+    pay_id = None
+    for p in (pays.get("items") or []):
+        if not isinstance(p, dict) or p.get("status") != "captured":
+            continue
+        if int(p.get("amount") or 0) != amount or (p.get("currency") or "INR") != "INR":
+            continue
+        if ((p.get("notes") or {}).get("payment_ref") or ref) != ref:
+            continue
+        pay_id = p.get("id")
+        break
+    if not pay_id:
+        return "pending"
+    claimed = await run(STORE.claim_paid, ref, pay_id)
+    if claimed == "dup":
+        await run(STORE.set_status, ref, ["created", "expired", "cancelled"], "review",
+                  last_failure="razorpay payment id already used")
+        return "review"
+    if claimed:
+        await run(STORE.audit, "system", "payment_verified", ref, {"payment_id": pay_id, "via": "upi_qr"})
+    await activate(ref)
+    return "paid"
 
 
 # ----------------------------------------------------------------- expiry / reconcile
@@ -743,7 +874,12 @@ def http_dispatch(method: str, raw_path: str, body: bytes, headers):
 
 async def _handle_event(event: str, payload: dict):
     ents = payload.get("payload") or {}
-    if event in ("payment_link.paid", "payment_link.expired", "payment_link.cancelled", "payment_link.partially_paid"):
+    if event == "qr_code.credited":
+        qr = ((ents.get("qr_code") or {}).get("entity") or {})
+        pay = ((ents.get("payment") or {}).get("entity") or {})
+        if qr.get("id"):
+            await process_qr(qr["id"], pay.get("id"))
+    elif event in ("payment_link.paid", "payment_link.expired", "payment_link.cancelled", "payment_link.partially_paid"):
         link = ((ents.get("payment_link") or {}).get("entity") or {})
         pay = ((ents.get("payment") or {}).get("entity") or {})
         if link.get("id"):

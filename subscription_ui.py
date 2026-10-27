@@ -3,13 +3,14 @@
 Wired into the existing bot with two calls from bot.py: configure(...) and register_handlers(app).
 Callback prefixes used: `sub:` (users) and `sadm:` (admin only). Existing prefixes are untouched.
 """
+import asyncio
 import html
 import logging
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
@@ -18,6 +19,9 @@ import subscriptions as S
 log = logging.getLogger("promo-bot.subs.ui")
 CFG = {"admin_id": 0, "approved": set(), "back_to_main": None}
 STATE_TTL = 600
+BC = {"running": False, "task": None}
+DEFAULT_WELCOME = ("📢 <b>Promotion Bot</b>\n\nThis bot requires an active subscription.\n"
+                   "Choose a plan and pay securely online — access is activated automatically after payment is verified.")
 
 
 def configure(admin_id: int, approved_users: set, back_to_main):
@@ -65,10 +69,14 @@ def _sub_line(sub) -> str:
 
 
 # =============================================================== USER SIDE
-def welcome_view():
-    return ("📢 <b>Promotion Bot</b>\n\nThis bot requires an active subscription.\n"
-            "Choose a plan and pay securely online — access is activated automatically after payment is verified.",
-            [[B("💎 Purchase Subscription", "sub:home")]])
+async def welcome_view():
+    cur = None
+    if S.STORE:
+        try:
+            cur = await S.run(S.STORE.get_setting, "welcome_text")
+        except Exception:
+            log.warning("could not read welcome text; using default")
+    return (cur or DEFAULT_WELCOME), [[B("💎 Purchase Subscription", "sub:home")]]
 
 
 async def home_view(uid: int):
@@ -118,7 +126,7 @@ def payment_view(doc):
     if st == "created" and doc.get("short_url"):
         return (head + f"\nPay within ~{S.LINK_EXPIRY_MINUTES} minutes using the button below. "
                        "Access activates automatically once the payment is verified.",
-                [[InlineKeyboardButton("💳 Pay Now", url=doc["short_url"])],
+                [[InlineKeyboardButton("💳 Pay Now", url=doc["short_url"])], [B("📱 Pay via UPI QR", f"sub:qr:{ref}")],
                  [B("🔄 I've Paid — Check Status", f"sub:chk:{ref}")],
                  [B("❌ Cancel Payment", f"sub:cxl:{ref}")], [B("⬅️ Back", "sub:home")]])
     msg = {"expired": "This payment link expired. Start a new payment from the plans list.",
@@ -139,7 +147,7 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             if user.id in CFG["approved"] and CFG["back_to_main"]:
                 return await CFG["back_to_main"](update, ctx)
-            text, rows = welcome_view()
+            text, rows = await welcome_view()
             return await _edit(q, text, rows)
         if not S.STORE:
             return await q.answer("Subscriptions are temporarily unavailable.", show_alert=True)
@@ -166,6 +174,34 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             except RuntimeError as e:
                 return await _edit(q, f"⚠️ {h(e)}", [[B("⬅️ Back", "sub:home")]])
             return await _edit(q, *payment_view(doc))
+        if action == "qr" and len(parts) == 3:
+            doc = await S.run(S.STORE.get_payment, parts[2])
+            if not doc or int(doc["user_id"]) != user.id:
+                return await q.answer("Payment not found.", show_alert=True)
+            await q.answer("Generating QR…")
+            try:
+                doc = await S.create_qr(parts[2])
+            except RuntimeError as e:
+                return await ctx.bot.send_message(chat_id=q.message.chat_id, text=f"⚠️ {h(e)}", parse_mode=ParseMode.HTML)
+            caption = (f"📱 <b>Scan &amp; pay {S.fmt_inr(doc['amount_paise'])}</b> with any UPI app.\n"
+                       f"Plan: {h(doc['plan_name'])} ({doc['duration_days']} days)\n"
+                       "This QR accepts one payment of exactly this amount. Access activates after verification.")
+            return await ctx.bot.send_photo(chat_id=q.message.chat_id, photo=doc["qr_image_url"], caption=caption,
+                                            parse_mode=ParseMode.HTML,
+                                            reply_markup=InlineKeyboardMarkup([[B("🔄 I've Paid — Check Status", f"sub:qchk:{parts[2]}")]]))
+        if action == "qchk" and len(parts) == 3:
+            doc = await S.run(S.STORE.get_payment, parts[2])
+            if not doc or int(doc["user_id"]) != user.id:
+                return await q.answer("Payment not found.", show_alert=True)
+            try:
+                doc = await S.refresh_payment(parts[2])
+            except Exception as e:
+                log.warning("QR check failed: %s", e)
+            if doc and doc["status"] == "paid":
+                await q.answer("Payment verified ✅")
+                text, rows = payment_view(doc)
+                return await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+            return await q.answer("Not received yet. It can take a minute after you pay.", show_alert=True)
         if action in ("chk", "cxl") and len(parts) == 3:
             doc = await S.run(S.STORE.get_payment, parts[2])
             if not doc or int(doc["user_id"]) != user.id:
@@ -197,10 +233,20 @@ async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if user.id == CFG["admin_id"]:
         ctx.user_data.pop("sadm", None)
-    if user.id in CFG["approved"] or not _public_start_enabled():
+    if S.STORE:
+        try:
+            await S.run(S.STORE.touch_user, user.id, user.first_name)
+        except Exception:
+            log.warning("could not register bot user")
+    if user.id in CFG["approved"] or user.id == CFG["admin_id"] or not _public_start_enabled():
         return
-    text, rows = welcome_view()
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    text, rows = await welcome_view()
+    markup = InlineKeyboardMarkup(rows)
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest:
+        log.warning("welcome text rejected by Telegram; sending default")
+        await update.message.reply_text(DEFAULT_WELCOME, parse_mode=ParseMode.HTML, reply_markup=markup)
     raise ApplicationHandlerStop
 
 
@@ -225,10 +271,11 @@ def _ok(flag) -> str:
 async def dash_view():
     st = await S.run(S.STORE.stats)
     approved = len([u for u in CFG["approved"] if u != CFG["admin_id"]])
+    users_n = await S.run(S.STORE.count_users)
     lines = ["💎 <b>SUBSCRIPTIONS</b>", "",
              f"Subscribers: <b>{st['active']}</b> active · {st['expired']} expired · {st['revoked']} ended",
              f"Expiring: {st['exp3']} within 3d · {st['exp7']} within 7d",
-             f"Approved users (excl. owner): {approved}",
+             f"Approved users (excl. owner): {approved} · Bot users (broadcast list): {users_n}",
              f"Payments: <b>{st['pay_paid']}</b> paid · {st['pay_pending']} pending · {st['pay_other']} other",
              f"Revenue: <b>{S.fmt_inr(st['revenue_all'])}</b> total · {S.fmt_inr(st['revenue_30d'])} last 30d"]
     if st["unfulfilled"] or st["review"]:
@@ -238,6 +285,7 @@ async def dash_view():
     rows = [[B("📦 Plans", "sadm:plans"), B("💳 Payments", "sadm:pay:all:0")],
             [B("👥 Subscribers", "sadm:subs:all:0"), B("🔎 Find User", "sadm:find")],
             [B("🙋 Approved Users", "sadm:users"), B("⏰ Expiry Check", "sadm:exp")],
+            [B("📣 Broadcast", "sadm:bc"), B("👋 Welcome Msg", "sadm:wm")],
             [B("🧾 Audit Log", "sadm:audit:0")],
             [B("⬅️ Back", "adm:home")]]
     return "\n".join(lines), rows
@@ -479,6 +527,32 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             await S.expiry_sweep()
             await S.run(S.STORE.audit, f"admin:{actor}", "manual_sweep", "all")
             return await _edit(q, *await expiry_view("✅ Expiry sweep completed."))
+        if a == "bc":
+            if BC["running"]:
+                return await _edit(q, "📣 A broadcast is already running. Wait for its report.", [[B("⬅️ Back", "sadm:home")]])
+            n = await S.run(S.STORE.count_users)
+            return await _edit(q, *_prompt(ctx, "bc_wait", f"📣 <b>BROADCAST</b>\n\nRecipients: <b>{n}</b> registered users.\n\n"
+                                           "Send the message to broadcast (text, photo, video, etc.). It is copied exactly as you send it. "
+                                           "Your next message is previewed for confirmation."))
+        if a == "bcgo":
+            st = ctx.user_data.get("sadm") or {}
+            if st.get("act") != "bc_confirm":
+                return await _edit(q, "ℹ️ Nothing to send. Start the broadcast again.", [[B("⬅️ Back", "sadm:home")]])
+            if BC["running"]:
+                return await _edit(q, "📣 A broadcast is already running.", [[B("⬅️ Back", "sadm:home")]])
+            ctx.user_data.pop("sadm", None)
+            BC["running"] = True
+            BC["task"] = asyncio.create_task(_run_broadcast(ctx.bot, actor, st["from"], st["mid"]))
+            return await _edit(q, "📣 Broadcast started. The report will be sent here when it finishes.", [[B("⬅️ Back", "sadm:home")]])
+        if a == "wm":
+            return await _edit(q, *await welcome_admin_view())
+        if a == "wme":
+            return await _edit(q, *_prompt(ctx, "wm_text", "✏️ Send the new welcome message now. You can use Telegram formatting "
+                                           "(bold, italic, links). Max 3500 characters."))
+        if a == "wmr":
+            await S.run(S.STORE.del_setting, "welcome_text")
+            await S.run(S.STORE.audit, f"admin:{actor}", "welcome_reset", "welcome_text")
+            return await _edit(q, *await welcome_admin_view("↩️ Reset to the default welcome message."))
         if a == "audit":
             return await _edit(q, *await audit_view(int(parts[2])))
     except Exception:
@@ -501,8 +575,20 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
     if time.time() - st["ts"] > STATE_TTL:
         ctx.user_data.pop("sadm", None)
         return
-    txt = (msg.text or "").strip()
     act = st["act"]
+    if act in ("bc_wait", "bc_confirm", "wm_text"):
+        try:
+            text, rows = await _admin_special(ctx, msg, st, user)
+        except ValueError as e:
+            text, rows = f"❌ {h(e)}\n\nTry again or tap Cancel.", [[B("❌ Cancel", "sadm:cancel")]]
+        except Exception:
+            log.exception("sadm special step error")
+            ctx.user_data.pop("sadm", None)
+            text, rows = "❌ Something went wrong. See the logs.", [[B("⬅️ Back", "sadm:home")]]
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows),
+                             disable_web_page_preview=True)
+        raise ApplicationHandlerStop
+    txt = (msg.text or "").strip()
     actor = user.id
     try:
         if act == "pnew_name":
@@ -548,9 +634,99 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
     raise ApplicationHandlerStop
 
 
+async def welcome_admin_view(note=""):
+    cur = None
+    try:
+        cur = await S.run(S.STORE.get_setting, "welcome_text")
+    except Exception:
+        log.warning("could not read welcome text")
+    head = (note + "\n\n") if note else ""
+    text = (head + "👋 <b>WELCOME MESSAGE</b>\n\nShown to people who send /start without an active subscription.\n\n"
+            + ("<i>Custom message active.</i>" if cur else "<i>Using the default message.</i>") + "\n\n"
+            "— Preview —\n" + (cur or DEFAULT_WELCOME))
+    return text, [[B("✏️ Edit", "sadm:wme")], [B("↩️ Reset to default", "sadm:wmr")], [B("⬅️ Back", "sadm:home")]]
+
+
+async def _admin_special(ctx, msg, st, user):
+    """Broadcast and welcome-message steps. Returns (text, rows)."""
+    act = st["act"]
+    if act == "bc_wait":
+        ctx.user_data["sadm"] = {"act": "bc_confirm", "ts": time.time(), "from": msg.chat_id, "mid": msg.message_id}
+        n = await S.run(S.STORE.count_users)
+        try:
+            await ctx.bot.copy_message(chat_id=user.id, from_chat_id=msg.chat_id, message_id=msg.message_id)
+        except TelegramError:
+            ctx.user_data.pop("sadm", None)
+            raise ValueError("Telegram could not copy this message. Send a different one.")
+        return (f"📣 <b>CONFIRM BROADCAST</b>\n\nThe message above goes to <b>{n}</b> registered users "
+                "(users who blocked the bot are skipped).\n\nSend it now?",
+                [[B("✅ Send now", "sadm:bcgo")], [B("❌ Cancel", "sadm:cancel")]])
+    if act == "bc_confirm":
+        ctx.user_data.pop("sadm", None)
+        return "ℹ️ Broadcast cancelled. Open Broadcast again to start over.", [[B("⬅️ Back", "sadm:home")]]
+    if act == "wm_text":
+        if not msg.text:
+            raise ValueError("Send the welcome message as text.")
+        body = msg.text_html
+        if len(body) > 3500:
+            raise ValueError("Too long: keep it under 3500 characters.")
+        try:
+            await ctx.bot.send_message(chat_id=user.id, text=body, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except BadRequest as e:
+            raise ValueError(f"Telegram rejected the formatting ({e.message}). Edit it and send again.")
+        await S.run(S.STORE.set_setting, "welcome_text", body)
+        await S.run(S.STORE.audit, f"admin:{user.id}", "welcome_edit", "welcome_text", {"chars": len(body)})
+        ctx.user_data.pop("sadm", None)
+        return ("✅ Welcome message saved. The preview above is what new users will see.",
+                [[B("👋 Welcome Msg", "sadm:wm")], [B("⬅️ Back", "sadm:home")]])
+    return "ℹ️ Nothing to do.", [[B("⬅️ Back", "sadm:home")]]
+
+
+async def _run_broadcast(bot, admin_id: int, from_chat: int, mid: int):
+    started = time.time()
+    sent = failed = blocked = 0
+    try:
+        recips = await S.run(S.STORE.recipients)
+        for uid in recips:
+            for attempt in (1, 2):
+                try:
+                    await bot.copy_message(chat_id=uid, from_chat_id=from_chat, message_id=mid)
+                    sent += 1
+                    break
+                except RetryAfter as e:
+                    if attempt == 2:
+                        failed += 1
+                        break
+                    await asyncio.sleep(float(e.retry_after) + 0.5)
+                except Forbidden:
+                    blocked += 1
+                    await S.run(S.STORE.mark_blocked, uid)
+                    break
+                except TelegramError as e:
+                    failed += 1
+                    log.info("broadcast to %s failed: %s", uid, type(e).__name__)
+                    break
+            await asyncio.sleep(0.05)          # stays well under Telegram's ~30 msg/s limit
+        duration = int(time.time() - started)
+        stats = {"total": len(recips), "sent": sent, "blocked": blocked, "failed": failed, "seconds": duration}
+        await S.run(S.STORE.log_broadcast, {"created_at": S.now_utc(), "by": admin_id, **stats})
+        await S.run(S.STORE.audit, f"admin:{admin_id}", "broadcast", str(mid), stats)
+        report = (f"📣 <b>Broadcast finished</b>\n\nRecipients: <b>{stats['total']}</b>\nSent: <b>{sent}</b>\n"
+                  f"Blocked bot (removed from list): {blocked}\nFailed: {failed}\nTime: {duration}s")
+    except Exception:
+        log.exception("broadcast crashed")
+        report = f"⚠️ Broadcast stopped with an error after {sent} sent. See the logs."
+    finally:
+        BC["running"] = False
+    try:
+        await bot.send_message(chat_id=admin_id, text=report, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        log.warning("could not send broadcast report")
+
+
 def register_handlers(app):
     # group=-1 handlers only act for their own cases and otherwise let the existing handlers run unchanged.
     app.add_handler(CommandHandler("start", start_gate, filters=filters.ChatType.PRIVATE), group=-1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, sadm_text), group=-1)
+    app.add_handler(MessageHandler(~filters.COMMAND & filters.ChatType.PRIVATE, sadm_text), group=-1)
     app.add_handler(CallbackQueryHandler(sub_callback, pattern=r"^sub:"))
     app.add_handler(CallbackQueryHandler(sadm_callback, pattern=r"^sadm:"))
