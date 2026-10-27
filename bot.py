@@ -105,9 +105,10 @@ pacer = AccountPacer()
 
 MENU = ReplyKeyboardMarkup(
     [
-        ["📣 Promotion", "📝 Posts"],
-        ["👥 Accounts", "💬 Auto Reply"],
-        ["✏️ Edit/Set Bio", "📊 Monitoring"],
+        ["📣 Promotion"],
+        ["📝 Posts", "👥 Accounts"],
+        ["💬 Auto Reply", "✏️ Edit/Set Bio"],
+        ["📊 Monitoring"],
     ],
     resize_keyboard=True,
     is_persistent=True,
