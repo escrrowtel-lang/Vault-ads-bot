@@ -13,7 +13,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonDefault, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
@@ -105,9 +105,11 @@ pacer = AccountPacer()
 
 MENU = ReplyKeyboardMarkup(
     [
-        ["📣 Promotion", "📝 Posts"],
-        ["👥 Accounts", "💬 Auto Reply"],
-        ["✏️ Edit/Set Bio", "📊 Monitoring"],
+        ["📣 Promotion"],
+        ["📝 Posts", "👥 Accounts"],
+        ["💬 Auto Reply", "✏️ Edit/Set Bio"],
+        ["📊 Monitoring"],
+        ["⚙️ Admin Panel"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -223,6 +225,220 @@ BOT_ACCOUNT_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
 )
+
+# ---------------------------------------------------------------------------
+# Button system: screenshot-style reply layouts + owner-editable labels.
+# Telegram reply keyboards cannot take per-button colours or rounded corners,
+# so the look comes from emoji accents, full-width primary rows and paired rows.
+# Labels are saved in MongoDB. Handlers keep matching the default texts through
+# LABEL_TO_DEFAULT, so renaming a button never changes what it does.
+# ---------------------------------------------------------------------------
+
+ADMIN_PANEL_MENU = ReplyKeyboardMarkup(
+    [["🎨 Button Labels"], ["⬅️ Back"]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+MENU_SECTIONS = {
+    "MENU": "🧩 Main Menu",
+    "PROMOTION_MENU": "🧩 Promotion",
+    "ACCOUNTS_MENU": "🧩 Accounts",
+    "JOIN_GROUPS_MENU": "🧩 Join Groups",
+    "MONITORING_MENU": "🧩 Monitoring",
+    "BIO_MENU": "🧩 Edit Bio",
+    "BIO_SCOPE_MENU": "🧩 Bio Scope",
+    "POST_MENU": "🧩 Posts",
+    "POST_MODE_MENU": "🧩 Sending Mode",
+    "AUTO_REPLY_MENU": "🧩 Auto Reply",
+    "ADD_SESSION_MENU": "🧩 Add Session",
+    "BOT_ACCOUNT_MENU": "🧩 Bot Accounts",
+}
+SECTION_BY_TITLE = {title: name for name, title in MENU_SECTIONS.items()}
+FIXED_BUTTONS = {"⬅️ Back", "⚙️ Admin Panel", "🎨 Button Labels"}
+RESERVED_TEXTS = {"♻️ Reset Section", "♻️ Reset All Labels"}
+DEFAULT_LAYOUTS = {
+    name: [[getattr(b, "text", b) for b in row] for row in globals()[name].keyboard]
+    for name in MENU_SECTIONS
+}
+ALL_DEFAULT_BUTTONS = FIXED_BUTTONS | {t for rows in DEFAULT_LAYOUTS.values() for row in rows for t in row}
+EDITABLE_ALL = ALL_DEFAULT_BUTTONS - FIXED_BUTTONS
+EDITABLE_BY_SECTION = {
+    name: [t for row in rows for t in row if t not in FIXED_BUTTONS]
+    for name, rows in DEFAULT_LAYOUTS.items()
+}
+BUTTON_OVERRIDES: dict[str, str] = {}
+LABEL_TO_DEFAULT: dict[str, str] = {}
+LABEL_PENDING: dict[int, tuple[str, str]] = {}  # uid -> (section name, default button text)
+
+
+def button_label(default: str) -> str:
+    return BUTTON_OVERRIDES.get(default, default)
+
+
+def canonical_button_text(text: str) -> str:
+    """Map a (possibly renamed) button label back to its default text."""
+    return LABEL_TO_DEFAULT.get(text, text)
+
+
+def apply_button_layout() -> None:
+    """Rebuild every menu keyboard with the current labels."""
+    for name in MENU_SECTIONS:
+        globals()[name] = ReplyKeyboardMarkup(
+            [[button_label(t) for t in row] for row in DEFAULT_LAYOUTS[name]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+    LABEL_TO_DEFAULT.clear()
+    for default in ALL_DEFAULT_BUTTONS:
+        LABEL_TO_DEFAULT[button_label(default)] = default
+
+
+def _label_store():
+    return _access_mongo[MONGO_DB]["button_labels"]
+
+
+async def load_button_labels() -> None:
+    try:
+        docs = await asyncio.to_thread(lambda: list(_label_store().find({}, {"label": 1})))
+    except Exception as e:
+        log.warning("Button labels could not be loaded (%s); using defaults.", type(e).__name__)
+        docs = []
+    BUTTON_OVERRIDES.clear()
+    for doc in docs:
+        default, label = doc.get("_id"), doc.get("label")
+        if default in EDITABLE_ALL and isinstance(label, str) and label.strip():
+            BUTTON_OVERRIDES[default] = label.strip()
+    apply_button_layout()
+
+
+def _sections_markup() -> ReplyKeyboardMarkup:
+    rows = [[title] for title in MENU_SECTIONS.values()]
+    rows += [["♻️ Reset All Labels"], ["⬅️ Back"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def _section_markup(name: str) -> ReplyKeyboardMarkup:
+    editable = [button_label(t) for t in EDITABLE_BY_SECTION[name]]
+    rows = [editable[i:i + 2] for i in range(0, len(editable), 2)]
+    rows += [["♻️ Reset Section"], ["⬅️ Back"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+def _validate_label(default: str, new: str) -> tuple[str | None, str]:
+    label = (new or "").strip()
+    if not label or len(label) > 40 or "\n" in label:
+        return None, "Label 1–40 characters ka ek hi line ka hona chahiye."
+    taken = (ALL_DEFAULT_BUTTONS | set(MENU_SECTIONS.values()) | RESERVED_TEXTS) - {default}
+    taken |= {button_label(t) for t in ALL_DEFAULT_BUTTONS if t != default}
+    if label in taken:
+        return None, "Ye naam kisi aur button ya section ka hai. Koi aur naam do."
+    return label, ""
+
+
+async def _store_label(default: str, label: str) -> None:
+    if label == default:
+        # Saving the default text means "no override": keep the collection clean.
+        await asyncio.to_thread(_label_store().delete_one, {"_id": default})
+        BUTTON_OVERRIDES.pop(default, None)
+    else:
+        await asyncio.to_thread(_label_store().update_one, {"_id": default}, {"$set": {"label": label}}, True)
+        BUTTON_OVERRIDES[default] = label
+    apply_button_layout()
+
+
+async def _reset_labels(defaults) -> None:
+    defaults = list(defaults)
+    await asyncio.to_thread(_label_store().delete_many, {"_id": {"$in": defaults}})
+    for d in defaults:
+        BUTTON_OVERRIDES.pop(d, None)
+    apply_button_layout()
+
+
+async def _open_section(update, uid: int, name: str) -> None:
+    state[uid] = f"label_section:{name}"
+    await update.message.reply_text(
+        f"{MENU_SECTIONS[name]}\nNaam badalne ke liye button chuno.",
+        reply_markup=_section_markup(name),
+    )
+
+
+async def _open_label_sections(update, uid: int) -> None:
+    state[uid] = "label_sections"
+    await update.message.reply_text(
+        "🎨 <b>BUTTON LABELS</b>\nSection chuno:", parse_mode=ParseMode.HTML, reply_markup=_sections_markup()
+    )
+
+
+async def handle_button_admin(update, uid: int, text: str) -> bool:
+    """Owner-only Admin Panel and label editor. text is already canonical. True when handled."""
+    current = state.get(uid, "")
+    if text == "⚙️ Admin Panel":
+        if uid != ADMIN_ID:
+            await update.message.reply_text("⚙️ Admin Panel sirf owner ke liye hai.", reply_markup=MENU)
+            return True
+        state[uid] = "admin_panel"
+        await update.message.reply_text("⚙️ <b>ADMIN PANEL</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_PANEL_MENU)
+        return True
+    if uid != ADMIN_ID:
+        return False
+    if text == "🎨 Button Labels":
+        await _open_label_sections(update, uid)
+        return True
+    if current == "label_sections":
+        if text in SECTION_BY_TITLE:
+            await _open_section(update, uid, SECTION_BY_TITLE[text])
+            return True
+        if text == "♻️ Reset All Labels":
+            await _reset_labels(EDITABLE_ALL)
+            await update.message.reply_text("♻️ Saare button labels default par wapas.", reply_markup=_sections_markup())
+            return True
+        if text == "⬅️ Back":
+            state[uid] = "admin_panel"
+            await update.message.reply_text("⚙️ <b>ADMIN PANEL</b>", parse_mode=ParseMode.HTML, reply_markup=ADMIN_PANEL_MENU)
+            return True
+        return False
+    if current.startswith("label_section:"):
+        name = current.split(":", 1)[1]
+        if text == "⬅️ Back":
+            await _open_label_sections(update, uid)
+            return True
+        if text == "♻️ Reset Section":
+            await _reset_labels(EDITABLE_BY_SECTION[name])
+            await update.message.reply_text("♻️ Is section ke labels default par wapas.", reply_markup=_section_markup(name))
+            return True
+        if text in EDITABLE_BY_SECTION[name]:
+            LABEL_PENDING[uid] = (name, text)
+            state[uid] = "await_label"
+            await update.message.reply_text(
+                f"Current: <b>{esc(button_label(text))}</b>\nNaya label bhejo (1–40 characters).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ReplyKeyboardMarkup([["⬅️ Back"]], resize_keyboard=True, is_persistent=True),
+            )
+            return True
+    return False
+
+
+async def handle_label_input(update, uid: int, raw_text: str) -> None:
+    """Receives the new label text for a button that is waiting for one."""
+    name, default = LABEL_PENDING[uid]
+    if raw_text == "⬅️ Back":
+        LABEL_PENDING.pop(uid, None)
+        await _open_section(update, uid, name)
+        return
+    label, error = _validate_label(default, raw_text)
+    if error:
+        await update.message.reply_text(f"❌ {error}")
+        return
+    await _store_label(default, label)
+    LABEL_PENDING.pop(uid, None)
+    state[uid] = f"label_section:{name}"
+    await update.message.reply_text(
+        f"✅ Label save ho gaya: <b>{esc(label)}</b>\nAb ye button turant dikhega.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_section_markup(name),
+    )
+
 
 BOT_GROUP_REPLY_DEFAULT = os.getenv(
     "BOT_GROUP_REPLY_TEXT",
@@ -2434,6 +2650,15 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.pop("post_saved_message_id", None) == update.message.message_id:
         return
 
+    # Button system: label input first (raw text), otherwise map renamed labels to defaults.
+    current = state.get(uid)
+    if current == "await_label" and uid in LABEL_PENDING:
+        await handle_label_input(update, uid, text)
+        return
+    text = canonical_button_text(text)
+    if await handle_button_admin(update, uid, text):
+        return
+
     # Auto-reply submenu: always process Back before text input.
     current = state.get(uid)
     if text == "⬅️ Back":
@@ -3603,6 +3828,13 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def post_init(app: Application):
     await load_approved_users()
+    await load_button_labels()
+    # No command list means Telegram's bottom "Menu" button has nothing to show.
+    try:
+        await app.bot.delete_my_commands()
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    except TelegramError as e:
+        log.warning("Could not clear bot command menu: %s", type(e).__name__)
     # Owner database and legacy encrypted sessions are never migrated/deleted.
     for uid in sorted(APPROVED_USERS):
         await initialize_tenant(uid)
