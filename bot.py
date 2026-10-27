@@ -13,7 +13,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
@@ -3602,6 +3602,13 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def post_init(app: Application):
+    # Hide Telegram's bottom-left 'Menu' button: no bot command list is registered,
+    # so the commands-type menu button has nothing to show.
+    try:
+        await app.bot.delete_my_commands()
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e:
+        log.warning("Could not reset Telegram menu button: %s", e)
     await load_approved_users()
     # Owner database and legacy encrypted sessions are never migrated/deleted.
     for uid in sorted(APPROVED_USERS):
