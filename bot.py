@@ -3635,7 +3635,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error", exc_info=context.error)
 
 
+def start_health_server():
+    """Serve GET/HEAD / with 200 when PORT is set, so web-port health checks and cron pings pass."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="health").start()
+    log.info("Health endpoint listening on port %s", port)
+
+
 def main():
+    start_health_server()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("add", add_operator))
     app.add_handler(CommandHandler("rem", remove_operator))
@@ -3652,6 +3683,7 @@ def main():
     # A stranger messaging the control bot receives a cooldown-limited response.
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, authorized_handler(bot_dm_auto_reply)), group=2)
     app.add_error_handler(error_handler)
+    log.info("Starting Telegram polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
