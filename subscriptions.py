@@ -32,6 +32,7 @@ STALE_LOCK_SECONDS = 300
 REMINDER_DAYS = 3
 SWEEP_SECONDS = 60
 PAGE_SIZE = 8
+TRIAL_DAYS = 7                    # free trial length for every new user (one per Telegram user)
 
 
 # ----------------------------------------------------------------- config / helpers
@@ -229,6 +230,15 @@ class Store:
 
     def del_setting(self, key):
         self.settings.delete_one({"_id": f"{self.owner_id}:{key}"})
+
+    def has_sub_record(self, uid):
+        return self.subs.find_one({"_id": self.sid(uid)}, {"_id": 1}) is not None
+
+    def trial_enabled(self):
+        return self.get_setting("trial_enabled") is not False
+
+    def trials_started(self):
+        return self.subs.count_documents({"owner_id": self.owner_id, "plan_id": "trial"})
 
     def find_open_payment(self, user_id, plan_id, amount_paise):
         return self.payments.find_one(
@@ -807,6 +817,25 @@ async def _background_loop():
         except Exception:
             log.exception("Subscription background loop error")
         await asyncio.sleep(SWEEP_SECONDS)
+
+
+async def start_trial(uid: int, name: str = "") -> tuple[bool, str]:
+    """Free trial: once per Telegram user, grants full access for TRIAL_DAYS. No payment involved."""
+    if not STORE:
+        return False, "Subscriptions are temporarily unavailable. Please try again shortly."
+    if not await run(STORE.trial_enabled):
+        return False, "The free trial is not available right now."
+    async with user_lock(uid):
+        if await run(STORE.has_sub_record, uid):
+            return False, "You have already used your free trial or had a subscription. Please choose a paid plan."
+        was_approved = bool(HOOKS["is_approved"](uid))
+        ref = f"trial_{int(uid)}"
+        sub, _applied = await run(STORE.apply_subscription, uid, "trial", "Free Trial", TRIAL_DAYS, ref, was_approved,
+                                  manual=True)
+        await HOOKS["grant"](uid)
+        await run(STORE.audit, f"user:{uid}", "trial_started", ref, {"days": TRIAL_DAYS, "name": name[:40]})
+    return True, (f"🎁 <b>Free trial started!</b>\nFull access is active until <b>{fmt_dt(sub['expires_at'])}</b>.\n\n"
+                  "Tap below to open the bot.")
 
 
 # ----------------------------------------------------------------- admin manual actions

@@ -69,14 +69,22 @@ def _sub_line(sub) -> str:
 
 
 # =============================================================== USER SIDE
-async def welcome_view():
+async def welcome_view(uid=None):
     cur = None
     if S.STORE:
         try:
             cur = await S.run(S.STORE.get_setting, "welcome_text")
         except Exception:
             log.warning("could not read welcome text; using default")
-    return (cur or DEFAULT_WELCOME), [[B("💎 Purchase Subscription", "sub:home")]]
+    rows = []
+    if S.STORE and uid is not None:
+        try:
+            if await S.run(S.STORE.trial_enabled) and not await S.run(S.STORE.has_sub_record, uid):
+                rows.append([B(f"🎁 Start free {S.TRIAL_DAYS}-day trial", "sub:trial")])
+        except Exception:
+            log.warning("could not check trial eligibility")
+    rows.append([B("💎 Purchase Subscription", "sub:home")])
+    return (cur or DEFAULT_WELCOME), rows
 
 
 async def home_view(uid: int):
@@ -147,10 +155,15 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             if user.id in CFG["approved"] and CFG["back_to_main"]:
                 return await CFG["back_to_main"](update, ctx)
-            text, rows = await welcome_view()
+            text, rows = await welcome_view(user.id)
             return await _edit(q, text, rows)
         if not S.STORE:
             return await q.answer("Subscriptions are temporarily unavailable.", show_alert=True)
+        if action == "trial":
+            await q.answer()
+            ok, msg = await S.start_trial(user.id, user.first_name or "")
+            rows = [[B("🚀 Open bot", "sub:back")]] if ok else [[B("💎 Plans", "sub:home")], [B("⬅️ Back", "sub:back")]]
+            return await _edit(q, msg, rows)
         if action == "home":
             await q.answer()
             return await _edit(q, *await home_view(user.id))
@@ -240,7 +253,7 @@ async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
             log.warning("could not register bot user")
     if user.id in CFG["approved"] or user.id == CFG["admin_id"] or not _public_start_enabled():
         return
-    text, rows = await welcome_view()
+    text, rows = await welcome_view(user.id)
     markup = InlineKeyboardMarkup(rows)
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -272,6 +285,8 @@ async def dash_view(note=""):
     st = await S.run(S.STORE.stats)
     approved = len([u for u in CFG["approved"] if u != CFG["admin_id"]])
     users_n = await S.run(S.STORE.count_users)
+    trial_on = await S.run(S.STORE.trial_enabled)
+    trials_n = await S.run(S.STORE.trials_started)
     keys_ok = S.payments_configured()
     lines = []
     if note:
@@ -280,6 +295,7 @@ async def dash_view(note=""):
               "<b>Subscribers</b>",
               f"  ✅ Active: <b>{st['active']}</b>  ·  ⌛ Expired: {st['expired']}  ·  🚫 Ended: {st['revoked']}",
               f"  ⏰ Expiring in 3 days: {st['exp3']}  ·  in 7 days: {st['exp7']}",
+              f"  🎁 Free trial: {'ON' if trial_on else 'OFF'}  ·  trials started: {trials_n}",
               "", "<b>Payments</b>",
               f"  💰 Revenue: <b>{S.fmt_inr(st['revenue_all'])}</b> total · {S.fmt_inr(st['revenue_30d'])} last 30 days",
               f"  ✅ Paid: {st['pay_paid']}  ·  ⏳ Pending: {st['pay_pending']}  ·  ⚠️ Other: {st['pay_other']}",
@@ -295,6 +311,7 @@ async def dash_view(note=""):
             [B("📦 Plans", "sadm:plans"), B("⏰ Expiry Check", "sadm:exp")],
             [B("🙋 Approved Users", "sadm:users"), B("📣 Broadcast", "sadm:bc")],
             [B("👋 Welcome Msg", "sadm:wm"), B("🧾 Audit Log", "sadm:audit:0")],
+            [B("🎁 Toggle free trial", "sadm:trial")],
             [B("🔄 Verify pending now", "sadm:sync")],
             [B("⬅️ Back", "adm:home")]]
     return "\n".join(lines), rows
@@ -536,6 +553,11 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             await S.expiry_sweep()
             await S.run(S.STORE.audit, f"admin:{actor}", "manual_sweep", "all")
             return await _edit(q, *await expiry_view("✅ Expiry sweep completed."))
+        if a == "trial":
+            now_on = await S.run(S.STORE.trial_enabled)
+            await S.run(S.STORE.set_setting, "trial_enabled", not now_on)
+            await S.run(S.STORE.audit, f"admin:{actor}", "trial_toggle", "trial_enabled", {"enabled": not now_on})
+            return await _edit(q, *await dash_view(f"🎁 Free trial is now {'OFF' if now_on else 'ON'}."))
         if a == "sync":
             res = await S.verify_pending()
             note = (f"🔄 Checked <b>{res['checked']}</b> pending · <b>{res['paid']}</b> newly paid · "

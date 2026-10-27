@@ -1,4 +1,5 @@
 import asyncio
+import json
 import html
 import logging
 import os
@@ -179,6 +180,7 @@ PROMOTION_MENU = _inline_from_rows(
         ["⏱ Interval", "⏳ Group Delay"],
         ["🔄 Rescan Targets", "📨 DM Broadcast"],
         ["📅 Schedule"],
+        ["🎯 Promo Accounts"],
         ["⬅️ Back"],
     ],
 )
@@ -1844,13 +1846,17 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
 
 
 async def do_round(app: Application):
-    sessions = await session_store.get_sessions(enabled_only=True)
+    all_sessions = await session_store.get_sessions(enabled_only=True)
+    chosen = set(await promo_selected_ids([str(r["id"]) for r in all_sessions]))
+    sessions = [r for r in all_sessions if str(r["id"]) in chosen]
     posts = await db.list_posts(enabled_only=True)
     mode = await db.get_setting("post_mode", "rotate")
     if mode not in {"rotate", "random"}:
         mode = "rotate"
-    if not sessions:
+    if not all_sessions:
         raise RuntimeError("No active sessions")
+    if not sessions:
+        raise RuntimeError("No promotion accounts selected (📣 Promotion → 🎯 Promo Accounts)")
     if not posts:
         raise RuntimeError("No enabled promotion posts")
 
@@ -2589,6 +2595,73 @@ async def safe_delete_message(message):
         await message.delete()
     except Exception:
         pass
+
+
+# ---- Promotion category: which accounts are used (and therefore logged in) for ads.
+PROMO_ACCOUNTS_KEY = "promo_account_ids"
+
+
+async def promo_selected_ids(all_ids):
+    """Stored selection; if the admin never chose, every enabled account is used."""
+    raw = await db.get_setting(PROMO_ACCOUNTS_KEY, None)
+    if raw is None:
+        return list(all_ids)
+    try:
+        wanted = set(json.loads(raw))
+    except (TypeError, ValueError):
+        return list(all_ids)
+    return [i for i in all_ids if i in wanted]
+
+
+def _promo_accounts_view(rows, selected):
+    lines = ["🎯 <b>PROMO ACCOUNTS</b>", "",
+             "Only the accounts ticked below log in and send promotions in this category.",
+             f"Selected: <b>{len(selected)}</b> of {len(rows)}", ""]
+    buttons = []
+    for r in rows:
+        sid = str(r["id"])
+        name = r.get("first_name") or r.get("label") or str(r.get("tg_user_id") or sid)
+        mark = "✅" if sid in selected else "⬜"
+        buttons.append([InlineKeyboardButton(f"{mark} {str(name)[:30]}", callback_data=f"pacc:{sid}")])
+    if not rows:
+        lines.append("No active accounts yet. Add one from 👥 Accounts.")
+    buttons.append([InlineKeyboardButton("☑️ Select all", callback_data="pacc:all"),
+                    InlineKeyboardButton("🚫 Clear", callback_data="pacc:none")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="pacc:done")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def show_promo_accounts(message):
+    rows = await session_store.get_sessions(enabled_only=True)
+    selected = set(await promo_selected_ids([str(r["id"]) for r in rows]))
+    text, markup = _promo_accounts_view(rows, selected)
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def promo_accounts_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action == "done":
+        return await query.edit_message_text("📣 <b>PROMOTION</b>", parse_mode=ParseMode.HTML, reply_markup=PROMOTION_MENU)
+    rows = await session_store.get_sessions(enabled_only=True)
+    ids = [str(r["id"]) for r in rows]
+    selected = set(await promo_selected_ids(ids))
+    if action == "all":
+        selected = set(ids)
+    elif action == "none":
+        selected = set()
+    elif action in ids:
+        selected ^= {action}
+    else:
+        return
+    await db.set_setting(PROMO_ACCOUNTS_KEY, json.dumps(sorted(selected)))
+    text, markup = _promo_accounts_view(rows, selected)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
 
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3435,6 +3508,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ADD_SESSION_MENU,
         )
 
+    elif text == "🎯 Promo Accounts":
+        await show_promo_accounts(update.message)
+        return
     elif text == "👤 Sessions":
         rows = await session_store.get_sessions()
         if not rows:
@@ -3996,6 +4072,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_cancel), pattern=r"^sess_rm_no:[0-9a-fA-F]+$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(promo_accounts_callback), pattern=r"^pacc:(?:all|none|done|[0-9a-fA-F]+)$"))
     # Save-post handler must run before the generic text/menu handler.
     app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION), authorized_handler(save_post_message)), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, authorized_handler(save_post_message)), group=0)
