@@ -13,7 +13,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, ReplyKeyboardMarkup, Update
+from types import SimpleNamespace
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
@@ -103,16 +104,35 @@ pacer = AccountPacer()
 # Operator data is tenant-isolated in MongoDB; downloaded media remains on disk.
 # Legacy owner sessions remain accessible through the Mongo session store.
 
-MENU = ReplyKeyboardMarkup(
-    [
-        ["📣 Promotion"],
-        ["📝 Posts", "👥 Accounts"],
-        ["🤖 Auto Reply", "✏️ Edit Bio"],
-        ["📊 Monitoring"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
+# Normal replies clear any sub-menu reply keyboard; the main menu is inline (MAIN_INLINE).
+MENU = ReplyKeyboardRemove()
+MAIN_TEXT = (
+    "📢 <b>Promotion Bot</b>\n\nChoose a category below. Promotion, accounts, replies, "
+    "bio tools and monitoring are grouped to keep the main screen clean."
 )
+MAIN_INLINE = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("📣 Promotion", callback_data="main:promotion")],
+        [
+            InlineKeyboardButton("📝 Posts", callback_data="main:posts"),
+            InlineKeyboardButton("👥 Accounts", callback_data="main:accounts"),
+        ],
+        [
+            InlineKeyboardButton("🤖 Auto Reply", callback_data="main:autoreply"),
+            InlineKeyboardButton("✏️ Edit Bio", callback_data="main:bio"),
+        ],
+        [InlineKeyboardButton("📊 Monitoring", callback_data="main:monitoring")],
+    ]
+)
+# Each inline callback is routed through handle_menu using the same label as before.
+MAIN_CALLBACK_LABELS = {
+    "main:promotion": "📣 Promotion",
+    "main:posts": "📝 Posts",
+    "main:accounts": "👥 Accounts",
+    "main:autoreply": "🤖 Auto Reply",
+    "main:bio": "✏️ Edit Bio",
+    "main:monitoring": "📊 Monitoring",
+}
 
 PROMOTION_MENU = ReplyKeyboardMarkup(
     [
@@ -2389,14 +2409,20 @@ async def list_operators(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["👥 Approved users:"] + [f"• <code>{uid}</code>" for uid in operators]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+async def show_main_menu(message):
+    # A reply keyboard stays until replaced: send a short message that clears it, then delete it.
+    try:
+        tmp = await message.reply_text("🔄", reply_markup=MENU)
+        await tmp.delete()
+    except Exception:
+        pass
+    await message.reply_text(MAIN_TEXT, parse_mode=ParseMode.HTML, reply_markup=MAIN_INLINE)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return await bot_dm_auto_reply(update, context)
-    await update.message.reply_text(
-        "📢 <b>Promotion Bot</b>\n\nChoose a category below. Promotion, accounts, replies, bio tools and monitoring are grouped to keep the main screen clean.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=MENU,
-    )
+    await show_main_menu(update.message)
 
 
 async def cleanup_login_flow(uid: int):
@@ -2443,7 +2469,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("bio_mode", None)
         context.user_data.pop("bio_target", None)
         await cleanup_login_flow(uid)
-        await update.message.reply_text("Main menu.", reply_markup=MENU)
+        await show_main_menu(update.message)
         return
 
     # Clean category navigation from the main page.
@@ -3446,6 +3472,20 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use the menu buttons below.", reply_markup=MENU)
 
 
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    label = MAIN_CALLBACK_LABELS.get(query.data)
+    if not label or not query.message:
+        return
+    # message_id=-1 keeps handle_menu's post-saved check from matching None.
+    proxy = SimpleNamespace(
+        effective_user=query.from_user,
+        message=SimpleNamespace(text=label, message_id=-1, reply_text=query.message.reply_text),
+    )
+    await handle_menu(proxy, context)
+
+
 async def save_post_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update) or not update.message:
         return
@@ -3680,6 +3720,7 @@ def main():
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
     app.add_handler(CommandHandler("start", authorized_handler(start)))
+    app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
