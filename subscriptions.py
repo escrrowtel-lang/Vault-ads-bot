@@ -289,6 +289,12 @@ class Store:
         return list(self.payments.find({"owner_id": self.owner_id, "status": "paid",
                                         "fulfillment": {"$ne": "done"}}).limit(limit))
 
+    def pending_qr(self, limit=25):
+        now = now_utc()
+        return list(self.payments.find(
+            {"owner_id": self.owner_id, "status": "created", "qr_id": {"$type": "string"},
+             "created_at": {"$lt": now - timedelta(seconds=45), "$gt": now - timedelta(hours=26)}}).limit(limit))
+
     def pending_links(self, limit=25):
         now = now_utc()
         return list(self.payments.find(
@@ -752,7 +758,7 @@ async def send_reminders():
 
 
 async def reconcile():
-    """Safety net for missed webhooks / crashes."""
+    """Polling verification (no webhook needed): re-checks open payment links and UPI QRs with Razorpay."""
     for p in await run(STORE.unfulfilled_paid):
         await activate(p["_id"])
     if payments_configured():
@@ -760,22 +766,46 @@ async def reconcile():
             try:
                 await process_link(p["link_id"])
             except Exception as e:
-                log.warning("reconcile %s failed: %s", p["_id"], e)
+                log.warning("reconcile link %s failed: %s", p["_id"], e)
+        for p in await run(STORE.pending_qr):
+            try:
+                await process_qr(p["qr_id"])
+            except Exception as e:
+                log.warning("reconcile qr %s failed: %s", p["_id"], e)
+
+
+async def verify_pending() -> dict:
+    """Manual 'verify now' for the admin panel. Same logic as the background poll."""
+    checked = paid = activated = 0
+    for p in await run(STORE.unfulfilled_paid):
+        if await activate(p["_id"]):
+            activated += 1
+    if payments_configured():
+        for p in await run(STORE.pending_links):
+            checked += 1
+            try:
+                paid += (await process_link(p["link_id"])) == "paid"
+            except Exception as e:
+                log.warning("verify link %s failed: %s", p["_id"], e)
+        for p in await run(STORE.pending_qr):
+            checked += 1
+            try:
+                paid += (await process_qr(p["qr_id"])) == "paid"
+            except Exception as e:
+                log.warning("verify qr %s failed: %s", p["_id"], e)
+    return {"checked": checked, "paid": paid, "activated": activated}
 
 
 async def _background_loop():
-    tick = 0
     while True:
         try:
             await expiry_sweep()
-            if tick % 2 == 0:
-                await reconcile()
+            await reconcile()
             await send_reminders()
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Subscription background loop error")
-        tick += 1
         await asyncio.sleep(SWEEP_SECONDS)
 
 

@@ -268,25 +268,34 @@ def _ok(flag) -> str:
     return "✅" if flag else "❌"
 
 
-async def dash_view():
+async def dash_view(note=""):
     st = await S.run(S.STORE.stats)
     approved = len([u for u in CFG["approved"] if u != CFG["admin_id"]])
     users_n = await S.run(S.STORE.count_users)
-    lines = ["💎 <b>SUBSCRIPTIONS</b>", "",
-             f"Subscribers: <b>{st['active']}</b> active · {st['expired']} expired · {st['revoked']} ended",
-             f"Expiring: {st['exp3']} within 3d · {st['exp7']} within 7d",
-             f"Approved users (excl. owner): {approved} · Bot users (broadcast list): {users_n}",
-             f"Payments: <b>{st['pay_paid']}</b> paid · {st['pay_pending']} pending · {st['pay_other']} other",
-             f"Revenue: <b>{S.fmt_inr(st['revenue_all'])}</b> total · {S.fmt_inr(st['revenue_30d'])} last 30d"]
+    keys_ok = S.payments_configured()
+    lines = []
+    if note:
+        lines += [note, ""]
+    lines += ["💎 <b>SUBSCRIPTION ADMIN</b>", "",
+              "<b>Subscribers</b>",
+              f"  ✅ Active: <b>{st['active']}</b>  ·  ⌛ Expired: {st['expired']}  ·  🚫 Ended: {st['revoked']}",
+              f"  ⏰ Expiring in 3 days: {st['exp3']}  ·  in 7 days: {st['exp7']}",
+              "", "<b>Payments</b>",
+              f"  💰 Revenue: <b>{S.fmt_inr(st['revenue_all'])}</b> total · {S.fmt_inr(st['revenue_30d'])} last 30 days",
+              f"  ✅ Paid: {st['pay_paid']}  ·  ⏳ Pending: {st['pay_pending']}  ·  ⚠️ Other: {st['pay_other']}",
+              "", "<b>Users</b>",
+              f"  🙋 Approved: {approved}  ·  📣 Bot users (broadcast list): {users_n}"]
     if st["unfulfilled"] or st["review"]:
-        lines.append(f"⚠️ Attention: {st['unfulfilled']} paid but not activated · {st['review']} need review")
-    lines += ["", f"Razorpay keys {_ok(S.payments_configured())} · Webhook secret {_ok(S.webhook_configured())} · "
-                  f"Public URL {_ok(S.public_base().startswith('https://'))}"]
-    rows = [[B("📦 Plans", "sadm:plans"), B("💳 Payments", "sadm:pay:all:0")],
+        lines += ["", f"🚨 <b>Attention</b>: {st['unfulfilled']} paid but not activated · {st['review']} need review"]
+    lines += ["", "<b>System</b>",
+              f"  Razorpay keys {_ok(keys_ok)}  ·  Public URL {_ok(S.public_base().startswith('https://'))}",
+              f"  Payment verification by polling (every 1 min) {_ok(keys_ok)}  ·  webhook not required"]
+    rows = [[B("💳 Payments", "sadm:pay:all:0"), B("⏳ Pending", "sadm:pay:pending:0")],
             [B("👥 Subscribers", "sadm:subs:all:0"), B("🔎 Find User", "sadm:find")],
-            [B("🙋 Approved Users", "sadm:users"), B("⏰ Expiry Check", "sadm:exp")],
-            [B("📣 Broadcast", "sadm:bc"), B("👋 Welcome Msg", "sadm:wm")],
-            [B("🧾 Audit Log", "sadm:audit:0")],
+            [B("📦 Plans", "sadm:plans"), B("⏰ Expiry Check", "sadm:exp")],
+            [B("🙋 Approved Users", "sadm:users"), B("📣 Broadcast", "sadm:bc")],
+            [B("👋 Welcome Msg", "sadm:wm"), B("🧾 Audit Log", "sadm:audit:0")],
+            [B("🔄 Verify pending now", "sadm:sync")],
             [B("⬅️ Back", "adm:home")]]
     return "\n".join(lines), rows
 
@@ -527,6 +536,11 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             await S.expiry_sweep()
             await S.run(S.STORE.audit, f"admin:{actor}", "manual_sweep", "all")
             return await _edit(q, *await expiry_view("✅ Expiry sweep completed."))
+        if a == "sync":
+            res = await S.verify_pending()
+            note = (f"🔄 Checked <b>{res['checked']}</b> pending · <b>{res['paid']}</b> newly paid · "
+                    f"<b>{res['activated']}</b> activated.")
+            return await _edit(q, *await dash_view(note))
         if a == "bc":
             if BC["running"]:
                 return await _edit(q, "📣 A broadcast is already running. Wait for its report.", [[B("⬅️ Back", "sadm:home")]])
