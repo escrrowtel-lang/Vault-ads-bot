@@ -409,6 +409,7 @@ TENANT_DB: dict[int, Database] = {}
 TENANT_SESSIONS: dict[int, MongoSessionStore] = {}
 TENANT_STATS: dict[int, RuntimeStats] = {}
 PROMO_TASKS: dict[int, asyncio.Task] = {}
+KEY_MISMATCH_LOGGED: set[str] = set()     # accounts already reported for an undecryptable session
 LISTENER_TASKS: dict[int, asyncio.Task] = {}
 JOIN_QUEUE_TASKS: dict[int, asyncio.Task] = {}
 BOT_ACCOUNT_TASKS: dict[tuple[int, int], asyncio.Task] = {}
@@ -2449,8 +2450,17 @@ async def account_auto_reply_service(app: Application):
                             row.get("label", sid), type(e).__name__, delay,
                         )
                     except Exception as e:
-                        log.warning("Account listener unavailable for %s: %s",
-                                    row.get("label", sid), type(e).__name__)
+                        if "FERNET_KEY" in str(e):
+                            # Stored session was encrypted with a different key: retrying cannot fix it.
+                            if sid not in KEY_MISMATCH_LOGGED:
+                                KEY_MISMATCH_LOGGED.add(sid)
+                                log.error("Account %s: stored session cannot be decrypted with the current "
+                                          "FERNET_KEY. Restore the old key, or remove and add this account again.",
+                                          row.get("label", sid))
+                            listener_retry_after[sid] = time.monotonic() + 3600
+                        else:
+                            log.warning("Account listener unavailable for %s: %s",
+                                        row.get("label", sid), type(e).__name__)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
