@@ -693,7 +693,7 @@ async def create_qr(ref: str):
     if close_ts - now.timestamp() < QR_MIN_SECONDS:
         raise RuntimeError("This payment is about to expire. Please start a new payment.")
     body = {"type": "upi_qr", "usage": "single_use", "fixed_amount": True,
-            "payment_amount": int(doc["amount_paise"]), "name": f"{doc['plan_name']}"[:40],
+            "payment_amount": int(doc["amount_paise"]), "name": "Subscription",
             "description": f"{doc['duration_days']} days access"[:255], "close_by": close_ts,
             "notes": {"payment_ref": ref, "telegram_user_id": str(doc["user_id"])}}
     try:

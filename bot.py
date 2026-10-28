@@ -244,7 +244,7 @@ POST_MODE_MENU = _inline_from_rows(
 AUTO_REPLY_MENU = _inline_from_rows(
     [
         ["✏️ Account Reply", "✏️ Control Bot Reply"],
-        ["👁 Reply Preview", "🔄 Use Saved Post"],
+        ["👁 Reply Preview"],
         ["🟢 Toggle Account Reply", "🟢 Toggle Bot Reply"],
         ["🤖 AI Mode", "🔑 Groq API Key"],
         ["📚 AI Profile"],
@@ -2826,7 +2826,7 @@ async def plan_caps(uid: int) -> dict:
     if uid == ADMIN_ID or subs_core.STORE is None:
         return dict(FULL_CAPS)
     hit = _caps_cache.get(uid)
-    if hit and time.time() - hit[0] < 30:
+    if hit and time.time() - hit[0] < 300:
         return hit[1]
     try:
         sub = await subs_core.run(subs_core.STORE.get_sub, uid)
@@ -2859,6 +2859,9 @@ async def _gate_markup(uid, markup):
     """Removes buttons the user's plan does not include. Admin and non-chat sends are untouched."""
     if not isinstance(uid, int) or uid <= 0 or uid == ADMIN_ID or not isinstance(markup, InlineKeyboardMarkup):
         return markup
+    gated = BOT_BUTTON_TEXTS | AI_BUTTON_TEXTS
+    if not any(b.text in gated for row in markup.inline_keyboard for b in row):
+        return markup                       # no DB read for ordinary messages
     hidden = _hidden_for(await plan_caps(uid))
     if not hidden:
         return markup
