@@ -276,6 +276,17 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+_BG_TASKS: set = set()
+
+
+async def _record_user(uid, first_name):
+    try:
+        if await S.run(S.STORE.touch_user, uid, first_name):
+            await S.log_event(f"👋 New user · {h(first_name or '-')} · <code>{uid}</code>")
+    except Exception:
+        log.warning("could not register bot user")
+
+
 async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
     """/start for people WITHOUT access -> purchase screen. Approved users fall through to the existing /start."""
     user = update.effective_user
@@ -284,11 +295,10 @@ async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.id == CFG["admin_id"]:
         ctx.user_data.pop("sadm", None)
     if S.STORE:
-        try:
-            if await S.run(S.STORE.touch_user, user.id, user.first_name):
-                await S.log_event(f"👋 New user · {h(user.first_name or '-')} · <code>{user.id}</code>")
-        except Exception:
-            log.warning("could not register bot user")
+        # Recorded in the background so the reply never waits on the database.
+        task = asyncio.create_task(_record_user(user.id, user.first_name), name="touch_user")
+        _BG_TASKS.add(task)                     # keep a reference until it finishes
+        task.add_done_callback(_BG_TASKS.discard)
     if user.id in CFG["approved"] or user.id == CFG["admin_id"]:
         return
     if not _public_start_enabled():

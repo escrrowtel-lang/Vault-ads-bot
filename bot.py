@@ -2647,16 +2647,23 @@ def main_markup(uid: int):
     return InlineKeyboardMarkup(rows)
 
 
+_LEGACY_KB_DONE: set[int] = set()   # users whose legacy keyboard is known to be cleared
+
+
 async def _clear_legacy_keyboard(message, uid: int):
     """Remove the old bottom Reply Keyboard once per user (persisted), never again."""
     key = f"legacy_kb_cleared:{uid}"
+    if uid in _LEGACY_KB_DONE:
+        return
     try:
         adb = tenant_db(ADMIN_ID)
         if await adb.get_setting(key) == "1":
+            _LEGACY_KB_DONE.add(uid)
             return
         tmp = await message.reply_text("🔄", reply_markup=ReplyKeyboardRemove())
         await tmp.delete()
         await adb.set_setting(key, "1")
+        _LEGACY_KB_DONE.add(uid)
     except Exception:
         pass
 
@@ -3284,6 +3291,7 @@ async def look_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="adm:front")]])
     elif data == "frt:r":
         await tenant_db(ADMIN_ID).set_setting("front_text", "")
+        invalidate_front_text()
         text, markup = await front_admin_view("↩️ Reset to the default message.")
     elif data == "adm:fbio":
         text, markup = await fbio_view()
@@ -3347,6 +3355,7 @@ async def look_text_input(update: Update, uid: int, current: str, text: str):
             state[uid] = current
             return await msg.reply_text(f"❌ Telegram rejected the formatting ({e.message}). Edit and send again.")
         await tenant_db(ADMIN_ID).set_setting("front_text", body)
+        invalidate_front_text()
         t, m = await front_admin_view("✅ Front message saved.")
         return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
     if current == "await_free_tag":
@@ -3541,11 +3550,23 @@ async def ai_text_input(update: Update, uid: int, current: str, text: str):
                                 parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
 
 
+_FRONT_CACHE = {"value": None, "at": 0.0}
+
+
+def invalidate_front_text():
+    _FRONT_CACHE["at"] = 0.0
+
+
 async def main_text() -> str:
+    """Front message, cached briefly so every /start does not wait on the database."""
+    if _FRONT_CACHE["value"] is not None and time.monotonic() - _FRONT_CACHE["at"] < 120:
+        return _FRONT_CACHE["value"]
     try:
-        return (await tenant_db(ADMIN_ID).get_setting("front_text", "")) or MAIN_TEXT
+        value = (await tenant_db(ADMIN_ID).get_setting("front_text", "")) or MAIN_TEXT
     except Exception:
         return MAIN_TEXT
+    _FRONT_CACHE.update(value=value, at=time.monotonic())
+    return value
 
 
 # ---- Free-plan bio tag: accounts of free-plan users must keep the admin's tag in their bio.
