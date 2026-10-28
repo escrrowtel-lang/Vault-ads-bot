@@ -2756,7 +2756,7 @@ def _premium_text(text, mode):
 
 
 def _premium_markup(markup):
-    """Moves a leading mapped emoji from a button label into a premium button icon."""
+    """Adds the mapped premium emoji as the icon of a button; the label text is never changed."""
     if not isinstance(markup, InlineKeyboardMarkup) or not LOOK["premium_map"]:
         return markup
     keys = sorted(LOOK["premium_map"], key=len, reverse=True)
@@ -2768,7 +2768,6 @@ def _premium_markup(markup):
             k = next((k for k in keys if txt.startswith(k)), None)
             if k and len(txt) > len(k):
                 d = btn.to_dict()
-                d["text"] = txt[len(k):].lstrip()
                 d["icon_custom_emoji_id"] = LOOK["premium_map"][k]
                 new_row.append(InlineKeyboardButton.de_json(d, None))
             else:
