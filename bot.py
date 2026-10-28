@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import random
+import re
 import contextvars
 from functools import wraps
 from dataclasses import dataclass, field
@@ -15,12 +16,13 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from types import SimpleNamespace
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, ReplyKeyboardRemove, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, MessageEntity, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ExtBot,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -2522,10 +2524,15 @@ MAINTENANCE = {"on": False}
 
 
 def main_markup(uid: int):
-    rows = [list(r) for r in MAIN_INLINE.inline_keyboard]
+    rows = []
+    for row in MENU_LAYOUT:
+        btns = [styled_button(_menu_label(k), k) for k in row if not _menu_hidden(k)]
+        if btns:
+            rows.append(btns)
     if uid == ADMIN_ID:
-        rows.append([styled_button("🛡 Admin Panel", "adm:home")])
-    rows.append([styled_button("💎 Purchase Subscription", "sub:home")])  # NEW
+        rows.append([styled_button(_menu_label("adm:home"), "adm:home")])
+    if not _menu_hidden("sub:home"):
+        rows.append([styled_button(_menu_label("sub:home"), "sub:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2664,6 +2671,289 @@ async def promo_accounts_callback(update: Update, context: ContextTypes.DEFAULT_
             raise
 
 
+# ---- Front menu editor + premium emoji (admin: 🎨 Look & Emoji)
+MENU_ITEMS = [
+    ("main:promotion", "📣 Promotion"), ("main:posts", "📝 Posts"), ("main:accounts", "👥 Accounts"),
+    ("main:autoreply", "🤖 Auto Reply"), ("main:bio", "✏️ Edit Bio"), ("main:monitoring", "📊 Monitoring"),
+    ("adm:home", "🛡 Admin Panel"), ("sub:home", "💎 Purchase Subscription"),
+]
+MENU_DEFAULTS = dict(MENU_ITEMS)
+MENU_LAYOUT = [["main:promotion"], ["main:posts", "main:accounts"], ["main:autoreply", "main:bio"], ["main:monitoring"]]
+# menu: callback -> {"label": str (optional), "hidden": bool (optional)}; premium_map: normal emoji -> custom emoji id
+LOOK = {"menu": {}, "premium_on": False, "premium_map": {}}
+
+
+async def load_look_settings():
+    adb = tenant_db(ADMIN_ID)
+    try:
+        raw = await adb.get_setting("menu_overrides", None)
+        LOOK["menu"] = json.loads(raw) if raw else {}
+        raw = await adb.get_setting("premium_emoji", None)
+        data = json.loads(raw) if raw else {}
+        LOOK["premium_on"] = bool(data.get("on"))
+        LOOK["premium_map"] = dict(data.get("map") or {})
+    except (TypeError, ValueError):
+        log.warning("could not parse look settings; using defaults")
+
+
+async def save_look_settings():
+    adb = tenant_db(ADMIN_ID)
+    await adb.set_setting("menu_overrides", json.dumps(LOOK["menu"], ensure_ascii=False))
+    await adb.set_setting("premium_emoji", json.dumps({"on": LOOK["premium_on"], "map": LOOK["premium_map"]}, ensure_ascii=False))
+
+
+def _menu_label(key):
+    return (LOOK["menu"].get(key) or {}).get("label") or MENU_DEFAULTS[key]
+
+
+def _menu_hidden(key):
+    return key != "adm:home" and bool((LOOK["menu"].get(key) or {}).get("hidden"))
+
+
+def _premium_pattern():
+    keys = sorted(LOOK["premium_map"], key=len, reverse=True)
+    return re.compile("|".join(re.escape(k) for k in keys)) if keys else None
+
+
+def _premium_text(text, mode):
+    """Returns (new_text, entities). HTML: <tg-emoji> tags. Plain: custom_emoji entities."""
+    pat = _premium_pattern()
+    if pat is None or not text:
+        return text, None
+    m = LOOK["premium_map"]
+    if mode == "HTML":
+        out = []
+        for part in re.split(r"(<[^>]+>)", text):
+            if part.startswith("<") and part.endswith(">"):
+                out.append(part)
+            else:
+                out.append(pat.sub(lambda x: f'<tg-emoji emoji-id="{m[x.group(0)]}">{x.group(0)}</tg-emoji>', part))
+        return "".join(out), None
+    if mode in (None, ""):
+        ents = []
+        for x in pat.finditer(text):
+            off = len(text[:x.start()].encode("utf-16-le")) // 2
+            ln = len(x.group(0).encode("utf-16-le")) // 2
+            ents.append(MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=off, length=ln,
+                                      custom_emoji_id=m[x.group(0)]))
+        return text, (ents or None)
+    return text, None
+
+
+def _premium_markup(markup):
+    """Moves a leading mapped emoji from a button label into a premium button icon."""
+    if not isinstance(markup, InlineKeyboardMarkup) or not LOOK["premium_map"]:
+        return markup
+    keys = sorted(LOOK["premium_map"], key=len, reverse=True)
+    rows = []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for btn in row:
+            txt = btn.text or ""
+            k = next((k for k in keys if txt.startswith(k)), None)
+            if k and len(txt) > len(k):
+                d = btn.to_dict()
+                d["text"] = txt[len(k):].lstrip()
+                d["icon_custom_emoji_id"] = LOOK["premium_map"][k]
+                new_row.append(InlineKeyboardButton.de_json(d, None))
+            else:
+                new_row.append(btn)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(rows)
+
+
+class PremiumBot(ExtBot):
+    """Applies admin-chosen premium emoji to outgoing text/captions and button icons.
+    Any Telegram rejection falls back to the original, plain send so messages are never lost."""
+
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        if args:
+            return await super().send_message(chat_id, text, *args, **kwargs)
+        return await self._premium_send(super().send_message, dict(kwargs, chat_id=chat_id, text=text))
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        if args:
+            return await super().edit_message_text(text, *args, **kwargs)
+        return await self._premium_send(super().edit_message_text, dict(kwargs, text=text))
+
+    async def send_photo(self, photo, *args, **kwargs):
+        if args:
+            return await super().send_photo(photo, *args, **kwargs)
+        return await self._premium_send(super().send_photo, dict(kwargs, photo=photo))
+
+    async def _premium_send(self, method, kw):
+        if not LOOK["premium_on"] or not LOOK["premium_map"]:
+            return await method(**kw)
+        new = dict(kw)
+        key = "text" if "text" in kw else ("caption" if "caption" in kw else None)
+        if key and isinstance(kw[key], str) and kw.get("entities") is None and kw.get("caption_entities") is None:
+            new[key], ents = _premium_text(kw[key], kw.get("parse_mode"))
+            if ents:
+                new["entities" if key == "text" else "caption_entities"] = ents
+        if kw.get("reply_markup") is not None:
+            new["reply_markup"] = _premium_markup(kw["reply_markup"])
+        try:
+            return await method(**new)
+        except BadRequest as e:
+            log.warning("premium emoji send rejected (%s); sending plain", e)
+            return await method(**kw)
+
+
+def _utf16_slice(text, offset, length):
+    return text.encode("utf-16-le")[offset * 2:(offset + length) * 2].decode("utf-16-le")
+
+
+def look_home_view():
+    return ("🎨 <b>LOOK &amp; EMOJI</b>\n\nEdit the front menu and use premium emoji.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧭 Front Menu", callback_data="adm:menu")],
+                [InlineKeyboardButton("💠 Premium Emoji", callback_data="adm:emoji")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="adm:home")],
+            ]))
+
+
+def menu_editor_view(note=""):
+    lines = ["🧭 <b>FRONT MENU</b>", "", "Tap an item to rename or hide it. Actions stay the same.", ""]
+    rows = []
+    for i, (k, _default) in enumerate(MENU_ITEMS):
+        lbl = _menu_label(k)
+        lines.append(f"{i + 1}. {esc(lbl)}" + (" <i>(hidden)</i>" if _menu_hidden(k) else ""))
+        rows.append([InlineKeyboardButton(f"✏️ {lbl[:30]}", callback_data=f"mnu:e:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:look")])
+    return (note + "\n\n" if note else "") + "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def menu_item_view(idx, note=""):
+    k, default = MENU_ITEMS[idx]
+    status = "🙈 hidden" if _menu_hidden(k) else "👁 visible"
+    text = (f"🧭 <b>{esc(_menu_label(k))}</b>\n\nDefault: {esc(default)}\nStatus: {status}")
+    if note:
+        text = note + "\n\n" + text
+    rows = [[InlineKeyboardButton("✏️ Rename", callback_data=f"mnu:r:{idx}")]]
+    if k != "adm:home":
+        rows.append([InlineKeyboardButton("👁 Show" if _menu_hidden(k) else "🙈 Hide", callback_data=f"mnu:h:{idx}")])
+    rows.append([InlineKeyboardButton("↩️ Reset to default", callback_data=f"mnu:x:{idx}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:menu")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def emoji_view(note=""):
+    on, m = LOOK["premium_on"], LOOK["premium_map"]
+    lines = ["💠 <b>PREMIUM EMOJI</b>", "",
+             "Normal emoji in bot messages and button icons are replaced by the premium emoji mapped here.",
+             "Users with Telegram Premium see the premium version; others see the normal emoji.", "",
+             f"Status: <b>{'ON 🟢' if on else 'OFF 🔴'}</b>", f"Mapped: <b>{len(m)}</b>", ""]
+    rows = [[InlineKeyboardButton("🔁 Turn " + ("OFF" if on else "ON"), callback_data="emj:toggle")],
+            [InlineKeyboardButton("➕ Add premium emoji", callback_data="emj:add")]]
+    if not m:
+        lines.append("No mappings yet. Tap ➕ Add, then send one message that contains a premium emoji.")
+    for n, (base, eid) in enumerate(list(m.items())[:30]):
+        lines.append(f"{esc(base)} → <code>{esc(eid)}</code>")
+        rows.append([InlineKeyboardButton(f"🗑 Remove {base}", callback_data=f"emj:d:{n}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:look")])
+    return (note + "\n\n" if note else "") + "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def look_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q.from_user or q.from_user.id != ADMIN_ID:
+        return await q.answer("⛔ Admin only", show_alert=True)
+    await q.answer()
+    uid, data = q.from_user.id, q.data
+    text = markup = None
+    if data == "adm:look":
+        text, markup = look_home_view()
+    elif data == "adm:menu":
+        text, markup = menu_editor_view()
+    elif data == "adm:emoji":
+        text, markup = emoji_view()
+    elif data.startswith("mnu:"):
+        _, act, sidx = data.split(":")
+        idx = int(sidx)
+        if not 0 <= idx < len(MENU_ITEMS):
+            return
+        k, _d = MENU_ITEMS[idx]
+        if act == "e":
+            text, markup = menu_item_view(idx)
+        elif act == "r":
+            state[uid] = f"await_menu_label:{idx}"
+            text = f"✏️ Send the new label for <b>{esc(_menu_label(k))}</b> (1–40 characters, one line)."
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"mnu:e:{idx}")]])
+        elif act == "h" and k != "adm:home":
+            entry = LOOK["menu"].setdefault(k, {})
+            entry["hidden"] = not entry.get("hidden")
+            await save_look_settings()
+            text, markup = menu_item_view(idx, "✅ Saved.")
+        elif act == "x":
+            LOOK["menu"].pop(k, None)
+            await save_look_settings()
+            text, markup = menu_item_view(idx, "↩️ Reset to default.")
+    elif data.startswith("emj:"):
+        parts = data.split(":")
+        if parts[1] == "toggle":
+            LOOK["premium_on"] = not LOOK["premium_on"]
+            await save_look_settings()
+            text, markup = emoji_view("✅ Premium emoji " + ("ON" if LOOK["premium_on"] else "OFF") + ".")
+        elif parts[1] == "add":
+            state[uid] = "await_premium_emoji"
+            text = ("💠 Send one message that contains the premium emoji you want to use. "
+                    "Its normal emoji will be replaced by it everywhere.")
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="adm:emoji")]])
+        elif parts[1] == "d":
+            keys = list(LOOK["premium_map"])
+            n = int(parts[2])
+            if 0 <= n < len(keys):
+                LOOK["premium_map"].pop(keys[n], None)
+                await save_look_settings()
+                text, markup = emoji_view("🗑 Removed.")
+    if text is None:
+        return
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def look_text_input(update: Update, uid: int, current: str, text: str):
+    msg = update.message
+    state.pop(uid, None)
+    if text in {"⬅️ Back", "❌ Cancel"}:
+        t, m = look_home_view()
+        return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+    if current.startswith("await_menu_label:"):
+        idx = int(current.split(":", 1)[1])
+        label = text.strip()
+        if not 1 <= len(label) <= 40 or "\n" in label:
+            state[uid] = current
+            return await msg.reply_text("❌ Label must be 1–40 characters on one line. Send again or tap ❌ Cancel.")
+        k, default = MENU_ITEMS[idx]
+        entry = LOOK["menu"].setdefault(k, {})
+        if label == default:
+            entry.pop("label", None)
+        else:
+            entry["label"] = label
+        if not entry:
+            LOOK["menu"].pop(k, None)
+        await save_look_settings()
+        t, m = menu_editor_view("✅ Label updated.")
+        return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+    # await_premium_emoji
+    found = {}
+    for e in (msg.entities or []):
+        if e.type == "custom_emoji" and getattr(e, "custom_emoji_id", None):
+            base = _utf16_slice(text, e.offset, e.length)
+            if base:
+                found[base] = e.custom_emoji_id
+    if not found:
+        state[uid] = current
+        return await msg.reply_text("❌ No premium emoji in that message. Send one that contains a premium emoji, or tap ❌ Cancel.")
+    LOOK["premium_map"].update(found)
+    await save_look_settings()
+    t, m = emoji_view(f"✅ Added {len(found)} mapping(s).")
+    return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+
+
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update) or not update.message:
         return
@@ -2674,6 +2964,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Auto-reply submenu: always process Back before text input.
     current = state.get(uid)
+    if isinstance(current, str) and (current.startswith("await_menu_label:") or current == "await_premium_emoji"):
+        return await look_text_input(update, uid, current, text)
     if text == "⬅️ Back":
         state.pop(uid, None)
         context.user_data.pop("bio_kind", None)
@@ -3772,6 +4064,7 @@ def admin_markup():
     m = "ON 🔴" if MAINTENANCE["on"] else "OFF 🟢"
     return InlineKeyboardMarkup([
         [styled_button(f"🛠 Maintenance: {m}", "adm:maint")],
+        [styled_button("🎨 Look & Emoji", "adm:look")],
         [styled_button("👥 Approved Users", "adm:users")],
         [styled_button("💎 Subscriptions", "sadm:home")],  # NEW
         [styled_button("⬅️ Back", "adm:back")],
@@ -3958,6 +4251,7 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def post_init(app: Application):
+    await load_look_settings()
     # Hide Telegram's bottom-left 'Menu' button: no bot command list is registered,
     # so the commands-type menu button has nothing to show.
     try:
@@ -4060,7 +4354,7 @@ def start_health_server():
 
 def main():
     start_health_server()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = Application.builder().bot(PremiumBot(BOT_TOKEN)).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("add", add_operator))
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
@@ -4068,6 +4362,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back)$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
