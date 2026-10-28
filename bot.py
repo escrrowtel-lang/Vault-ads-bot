@@ -1795,9 +1795,50 @@ async def run_with_connection_retry(row: dict, operation_factory, purpose: str):
     raise ConnectionError(f"{purpose} failed after connection retries")
 
 
+TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="(\d+)">(.*?)</tg-emoji>', re.S)
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def saved_html_to_telegram(html_text: str):
+    """Saved post HTML -> (plain text, entities) for Telethon.
+
+    Premium emoji (<tg-emoji>) become custom-emoji entities with their original IDs, so they
+    go out exactly as the admin saved them. Other formatting uses Telethon's HTML parser.
+    """
+    from telethon.extensions import html as tl_html
+
+    parts, entities, offset, pos = [], [], 0, 0
+
+    def add_segment(segment: str):
+        nonlocal offset
+        if not segment:
+            return
+        seg_text, seg_entities = tl_html.parse(segment)
+        for ent in seg_entities or []:
+            ent.offset += offset
+        entities.extend(seg_entities or [])
+        parts.append(seg_text)
+        offset += _utf16_len(seg_text)
+
+    for match in TG_EMOJI_RE.finditer(html_text or ""):
+        add_segment(html_text[pos:match.start()])
+        fallback = html.unescape(re.sub(r"<[^>]+>", "", match.group(2)))
+        if fallback:
+            entities.append(types.MessageEntityCustomEmoji(
+                offset=offset, length=_utf16_len(fallback), document_id=int(match.group(1))))
+            parts.append(fallback)
+            offset += _utf16_len(fallback)
+        pos = match.end()
+    add_segment((html_text or "")[pos:])
+    return "".join(parts), entities
+
+
 async def send_saved_post(client: TelegramClient, entity, post: dict):
-    text = post.get("html_text") or ""
     media_path = post.get("media_path")
+    text, entities = saved_html_to_telegram(post.get("html_text") or "")
     if media_path:
         if not Path(media_path).exists():
             raise FileNotFoundError(f"Saved media missing: {media_path}")
@@ -1805,10 +1846,10 @@ async def send_saved_post(client: TelegramClient, entity, post: dict):
             entity,
             media_path,
             caption=text or None,
-            parse_mode="html",
+            formatting_entities=entities or None,
         )
     else:
-        await client.send_message(entity, text, parse_mode="html", link_preview=False)
+        await client.send_message(entity, text, formatting_entities=entities or None, link_preview=False)
 
 
 def pick_post(posts: list[dict], mode: str, index: int, round_number: int = 1, previous_id=None):
