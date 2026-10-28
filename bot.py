@@ -5096,7 +5096,10 @@ def start_health_server():
 
 def main():
     start_health_server()
-    app = Application.builder().bot(PremiumBot(BOT_TOKEN)).post_init(post_init).post_shutdown(post_shutdown).build()
+    # Slow networks on new hosts caused startup timeouts; allow longer waits.
+    app = (Application.builder().bot(PremiumBot(BOT_TOKEN)).post_init(post_init).post_shutdown(post_shutdown)
+           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+           .get_updates_connect_timeout(30).get_updates_read_timeout(60).build())
     app.add_handler(CommandHandler("add", add_operator))
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
@@ -5120,7 +5123,8 @@ def main():
     subs_ui.register_handlers(app)                                    # NEW
     app.add_error_handler(error_handler)
     log.info("Starting Telegram polling")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # bootstrap_retries=-1: keep retrying the first Telegram connection instead of exiting on one timeout.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
