@@ -2741,36 +2741,59 @@ HELP_ADMIN_SECTION = (
 )
 
 
-def help_messages(uid=None) -> list:
-    title = ("❓ <b>How to use this bot</b>\n"
-             "<blockquote>Step-by-step guide. Tap a section to open it.</blockquote>")
+HELP_TITLE = ("❓ <b>How to use this bot</b>\n"
+              "<blockquote>Step-by-step guide. Tap a section to open it.</blockquote>")
+HELP_BANNER = Path(__file__).resolve().parent / "assets" / "help_banner.png"
+
+
+def help_messages(uid=None, title=True) -> list:
     sections = list(HELP_SECTIONS)
     if uid is not None and can_open_panel(uid):
         sections.insert(-1, HELP_ADMIN_SECTION)
     parts = [f"<b>{t}</b>\n<blockquote expandable>{html.escape(b)}</blockquote>" for t, b in sections]
-    out, cur = [], title
+    out, cur = [], (HELP_TITLE if title else "")
     for p in parts:
         if len(cur) + len(p) + 2 > 3800:
             out.append(cur)
             cur = p
         else:
-            cur = cur + "\n\n" + p
+            cur = (cur + "\n\n" + p) if cur else p
     out.append(cur)
     return out
+
+
+def _help_banner_bytes():
+    try:
+        return HELP_BANNER.read_bytes()
+    except OSError:
+        return None
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user or update.effective_chat.type != "private":
         return
-    for chunk in help_messages(update.effective_user.id):
+    chunks = help_messages(update.effective_user.id, title=False)
+    photo = _help_banner_bytes()
+    if photo:
+        await update.message.reply_photo(photo=photo, caption=HELP_TITLE, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(HELP_TITLE, parse_mode=ParseMode.HTML)
+    for chunk in chunks:
         await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    for chunk in help_messages(q.from_user.id):
-        await context.bot.send_message(chat_id=q.message.chat.id, text=chunk, parse_mode=ParseMode.HTML)
+    chat_id = q.message.chat.id
+    chunks = help_messages(q.from_user.id, title=False)
+    photo = _help_banner_bytes()
+    if photo:
+        await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=HELP_TITLE, parse_mode=ParseMode.HTML)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=HELP_TITLE, parse_mode=ParseMode.HTML)
+    for chunk in chunks:
+        await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
