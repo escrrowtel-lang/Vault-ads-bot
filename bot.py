@@ -5238,25 +5238,40 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def post_init(app: Application):
-    await load_look_settings()
-    await load_co_admins()
+    async def _timed(label, aw):
+        began = time.monotonic()
+        try:
+            return await aw
+        finally:
+            log.info("startup: %s %.2fs", label, time.monotonic() - began)
+
+    async def _telegram_setup():
+        # Bottom-left 'Menu' button lists /start and /help.
+        try:
+            await app.bot.set_my_commands([BotCommand("start", "Open the main menu"),
+                                           BotCommand("help", "How to use this bot")])
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        except Exception as e:
+            log.warning("Could not set Telegram commands/menu button: %s", e)
+
+    # Independent steps run together instead of one after another.
+    await asyncio.gather(
+        _timed("telegram commands", _telegram_setup()),
+        _timed("look settings", load_look_settings()),
+        _timed("co-admins", load_co_admins()),
+        _timed("approved users", load_approved_users()),
+        _timed("admin settings", load_admin_settings()),
+    )
     asyncio.create_task(free_bio_guard_loop(), name="free_bio_guard")
-    # Bottom-left 'Menu' button lists /start and /help.
-    try:
-        await app.bot.set_my_commands([BotCommand("start", "Open the main menu"),
-                                       BotCommand("help", "How to use this bot")])
-        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    except Exception as e:
-        log.warning("Could not reset Telegram menu button: %s", e)
-    await load_approved_users()
-    await load_admin_settings()
-    await sub_start(app)  # NEW: subscriptions (expired users are revoked before listeners start)
+    await _timed("subscriptions", sub_start(app))  # expired users are revoked before listeners start
     # Owner database and legacy encrypted sessions are never migrated/deleted.
+    began = time.monotonic()
     for uid in sorted(APPROVED_USERS):
         await initialize_tenant(uid)
         await start_tenant_listener(app, uid)
         await start_join_queue_service(app, uid)
         await sync_bot_account_listeners(app, uid)
+    log.info("startup: %d operator(s) ready %.2fs", len(APPROVED_USERS), time.monotonic() - began)
 
 
 async def post_shutdown(app: Application):

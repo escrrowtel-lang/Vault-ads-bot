@@ -21,7 +21,7 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger("promo-bot.subs")
@@ -146,21 +146,34 @@ class Store:
 
     def init(self):
         self.client.admin.command("ping")
-        self.plans.create_index([("owner_id", ASCENDING), ("plan_id", ASCENDING)], unique=True)
-        self.plans.create_index([("owner_id", ASCENDING), ("enabled", ASCENDING)])
-        self.payments.create_index([("owner_id", ASCENDING), ("link_id", ASCENDING)], unique=True,
-                                   partialFilterExpression={"link_id": {"$type": "string"}})
-        self.payments.create_index([("owner_id", ASCENDING), ("razorpay_payment_id", ASCENDING)], unique=True,
-                                   partialFilterExpression={"razorpay_payment_id": {"$type": "string"}})
-        self.payments.create_index([("owner_id", ASCENDING), ("user_id", ASCENDING), ("created_at", DESCENDING)])
-        self.payments.create_index([("owner_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)])
-        self.subs.create_index([("owner_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
-        self.subs.create_index([("owner_id", ASCENDING), ("status", ASCENDING), ("expires_at", ASCENDING)])
-        self.audit_log.create_index([("owner_id", ASCENDING), ("created_at", DESCENDING)])
-        self.events.create_index([("created_at", ASCENDING)], expireAfterSeconds=30 * 86400)
-        self.payments.create_index([("owner_id", ASCENDING), ("qr_id", ASCENDING)], unique=True,
-                                   partialFilterExpression={"qr_id": {"$type": "string"}})
-        self.users.create_index([("owner_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+        # One round trip per collection; the same index specs as before.
+        self.plans.create_indexes([
+            IndexModel([("owner_id", ASCENDING), ("plan_id", ASCENDING)], unique=True),
+            IndexModel([("owner_id", ASCENDING), ("enabled", ASCENDING)]),
+        ])
+        self.payments.create_indexes([
+            IndexModel([("owner_id", ASCENDING), ("link_id", ASCENDING)], unique=True,
+                       partialFilterExpression={"link_id": {"$type": "string"}}),
+            IndexModel([("owner_id", ASCENDING), ("razorpay_payment_id", ASCENDING)], unique=True,
+                       partialFilterExpression={"razorpay_payment_id": {"$type": "string"}}),
+            IndexModel([("owner_id", ASCENDING), ("user_id", ASCENDING), ("created_at", DESCENDING)]),
+            IndexModel([("owner_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)]),
+            IndexModel([("owner_id", ASCENDING), ("qr_id", ASCENDING)], unique=True,
+                       partialFilterExpression={"qr_id": {"$type": "string"}}),
+        ])
+        self.subs.create_indexes([
+            IndexModel([("owner_id", ASCENDING), ("user_id", ASCENDING)], unique=True),
+            IndexModel([("owner_id", ASCENDING), ("status", ASCENDING), ("expires_at", ASCENDING)]),
+        ])
+        self.audit_log.create_indexes([
+            IndexModel([("owner_id", ASCENDING), ("created_at", DESCENDING)]),
+        ])
+        self.events.create_indexes([
+            IndexModel([("created_at", ASCENDING)], expireAfterSeconds=30 * 86400),
+        ])
+        self.users.create_indexes([
+            IndexModel([("owner_id", ASCENDING), ("user_id", ASCENDING)], unique=True),
+        ])
 
     def close(self):
         self.client.close()
