@@ -17,7 +17,8 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from types import SimpleNamespace
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, MessageEntity, ReplyKeyboardRemove, Update
+from telegram import (Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, MessageEntity,
+                      ReplyKeyboardRemove, Update)
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
@@ -2675,6 +2676,94 @@ async def show_main_menu(message, uid: int | None = None):
     LAST_MENU[chat_id] = sent.message_id
 
 
+# ---- Help guide: /help command and the ❓ How to Use button. Each section is an expandable quote.
+HELP_SECTIONS = [
+    ("🚀 Getting Started",
+     "1. Tap Start or the Menu button to open the main menu.\n"
+     "2. New users can start a free trial or buy a subscription.\n"
+     "3. Subscriptions are paid by QR code only. Access turns on after payment is confirmed.\n"
+     "4. Check your plan any time from Purchase Subscription."),
+    ("📣 Promotion",
+     "▶️ Start Promo / ⏹ Stop Promo: run or stop your ad rounds.\n"
+     "⏱ Interval: wait time between rounds.\n"
+     "⏳ Group Delay: pause between groups.\n"
+     "🔄 Rescan Targets: refresh the group list.\n"
+     "📨 DM Broadcast: message your contacts.\n"
+     "📅 Schedule: set timed runs.\n"
+     "🎯 Promo Accounts: choose which accounts send ads."),
+    ("📝 Posts",
+     "📝 Save Post: store a post to send.\n"
+     "📋 List Posts and 👁 Preview Post: review saved posts.\n"
+     "🔘 Toggle Post: turn a post on or off.\n"
+     "🗑 Delete Post: remove a post.\n"
+     "🔀 Sending Mode: Rotate goes in order, Random picks any post."),
+    ("👥 Accounts",
+     "➕ Add Session: add an account by session string or phone login.\n"
+     "👤 Sessions: see every connected account.\n"
+     "🔗 Join Groups: add group links and track the join queue.\n"
+     "🤖 Bot Accounts: connect your bot tokens.\n"
+     "🗑 Remove Session: remove an account."),
+    ("🤖 Auto Reply",
+     "✏️ Account Reply / Control Bot Reply: set the reply text.\n"
+     "🟢 Toggle buttons: switch replies on or off.\n"
+     "🤖 AI Mode: replies with AI using your Groq API key. Accept the rules first.\n"
+     "📚 AI Profile: describe your business so the AI answers well.\n"
+     "⏱ Reply Cooldown: limit how often one chat gets a reply.\n"
+     "📡 Reply Status: see what is running."),
+    ("✏️ Edit Bio",
+     "🤖 Set Bot Bio / 👤 Set User Bio: change the bio text.\n"
+     "👤 Individual: change one account.\n"
+     "🌐 Set All: change every account."),
+    ("📊 Monitoring",
+     "📊 Live Stats: what is running right now.\n"
+     "📊 Account Stats: numbers per account.\n"
+     "📜 Account Logs: recent events."),
+    ("💡 Tips",
+     "• Never share your session strings or bot tokens.\n"
+     "• Keep interval and group delay high to stay safe.\n"
+     "• Flood waits pause automatically. Let them finish.\n"
+     "• Need help? Use Support from the Purchase Subscription menu."),
+]
+HELP_ADMIN_SECTION = (
+    "🛡 Admin Panel",
+    "🛡 Admin Panel: manage approved users, subscriptions, broadcasts, support and account status.\n"
+    "👮 Co-Admins: the owner grants you specific sections.\n"
+    "🎨 Look & Emoji, 🔧 Maintenance and the log channel: owner only.",
+)
+
+
+def help_messages(uid=None) -> list:
+    title = ("❓ <b>How to use this bot</b>\n"
+             "<blockquote>Step-by-step guide. Tap a section to open it.</blockquote>")
+    sections = list(HELP_SECTIONS)
+    if uid is not None and can_open_panel(uid):
+        sections.insert(-1, HELP_ADMIN_SECTION)
+    parts = [f"<b>{t}</b>\n<blockquote expandable>{html.escape(b)}</blockquote>" for t, b in sections]
+    out, cur = [], title
+    for p in parts:
+        if len(cur) + len(p) + 2 > 3800:
+            out.append(cur)
+            cur = p
+        else:
+            cur = cur + "\n\n" + p
+    out.append(cur)
+    return out
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user or update.effective_chat.type != "private":
+        return
+    for chunk in help_messages(update.effective_user.id):
+        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    for chunk in help_messages(q.from_user.id):
+        await context.bot.send_message(chat_id=q.message.chat.id, text=chunk, parse_mode=ParseMode.HTML)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         return await bot_dm_auto_reply(update, context)
@@ -2783,15 +2872,15 @@ async def promo_accounts_callback(update: Update, context: ContextTypes.DEFAULT_
 MENU_ITEMS = [
     ("main:promotion", "Promotion"), ("main:posts", "Posts"), ("main:accounts", "Accounts"),
     ("main:autoreply", "Auto Reply"), ("main:bio", "Edit Bio"), ("main:monitoring", "Monitoring"),
-    ("adm:home", "Admin Panel"), ("sub:home", "Purchase Subscription"),
+    ("help:main", "How to Use"), ("adm:home", "Admin Panel"), ("sub:home", "Purchase Subscription"),
 ]
 MENU_DEFAULTS = dict(MENU_ITEMS)
 # Normal emoji that a premium emoji replaces for each front-menu button (not shown on the button itself).
 NORMAL_EMOJI_FOR = {
     "main:promotion": "📣", "main:posts": "📝", "main:accounts": "👥", "main:autoreply": "🤖",
-    "main:bio": "✏️", "main:monitoring": "📊", "adm:home": "🛡", "sub:home": "💎",
+    "main:bio": "✏️", "main:monitoring": "📊", "help:main": "❓", "adm:home": "🛡", "sub:home": "💎",
 }
-MENU_LAYOUT = [["main:promotion"], ["main:posts", "main:accounts"], ["main:autoreply", "main:bio"], ["main:monitoring"]]
+MENU_LAYOUT = [["main:promotion"], ["main:posts", "main:accounts"], ["main:autoreply", "main:bio"], ["main:monitoring", "help:main"]]
 # menu: callback -> {"label": str (optional), "hidden": bool (optional)}; premium_map: normal emoji -> custom emoji id
 LOOK = {"menu": {}, "premium_on": False, "premium_map": {}}
 
@@ -5152,10 +5241,10 @@ async def post_init(app: Application):
     await load_look_settings()
     await load_co_admins()
     asyncio.create_task(free_bio_guard_loop(), name="free_bio_guard")
-    # Hide Telegram's bottom-left 'Menu' button: no bot command list is registered,
-    # so the commands-type menu button has nothing to show.
+    # Bottom-left 'Menu' button lists /start and /help.
     try:
-        await app.bot.delete_my_commands()
+        await app.bot.set_my_commands([BotCommand("start", "Open the main menu"),
+                                       BotCommand("help", "How to use this bot")])
         await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     except Exception as e:
         log.warning("Could not reset Telegram menu button: %s", e)
@@ -5265,6 +5354,8 @@ def main():
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
     app.add_handler(CommandHandler("start", authorized_handler(start)))
+    app.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CallbackQueryHandler(authorized_handler(help_callback), pattern=r"^help:main$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back|acc|cleanpre|cleanok)$"))
