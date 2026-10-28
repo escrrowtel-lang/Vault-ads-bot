@@ -501,19 +501,109 @@ async def record_account_event(row, metric, target_type, target_name, outcome, e
         log.warning('Account log write failed for %s', row['label'])
 
 
-async def edit_account_progress(row, metric, *, force=False):
-    key = metric_key(row['id'], metric['kind'])
-    message = ACCOUNT_PROGRESS_MESSAGES.get(key)
-    if not message or (not force and time.monotonic() - metric['last_edit'] < 12):
+DASH: dict[int, dict] = {}          # tenant -> {"msg","lock","last","text","task"}
+DASH_EDIT_SECONDS = 10
+DASH_MAX_CHARS = 3800
+
+
+def _dash_account_block(metric):
+    kind = "Promo" if metric["kind"] == "promo" else "DM"
+    return (f"👤 <b>{esc(metric['label'])}</b> · {kind}\n"
+            f"State: <b>{esc(metric['status'])}</b> · {metric['attempted']}/{metric['total']}\n"
+            f"✅ {metric['sent']} · ❌ {metric['failed']} · ⏭ {metric['skipped']} · ⏳ FW {metric['flood_waits']}\n"
+            f"🎯 {esc(metric['target'])[:80]}\n"
+            f"⚠️ {esc(metric['last_error'])[:100]}")
+
+
+def dash_text() -> str:
+    """One message: live stats plus a compact block per account, kept under Telegram's limit."""
+    head = stats_text()
+    tid = tenant_id()
+    blocks = [_dash_account_block(m) for key, m in ACCOUNT_METRICS.items() if key[0] == tid]
+    if not blocks:
+        return head
+    kept, used = [], len(head) + 40
+    for block in blocks:
+        if used + len(block) + 2 > DASH_MAX_CHARS:
+            break
+        kept.append(block)
+        used += len(block) + 2
+    more = len(blocks) - len(kept)
+    tail = f"\n…and {more} more account(s)" if more else ""
+    return head + "\n\n👥 <b>ACCOUNTS</b>\n\n" + "\n\n".join(kept) + tail
+
+
+async def _dash_flusher():
+    while True:
+        await asyncio.sleep(DASH_EDIT_SECONDS)
+        try:
+            await dash_refresh(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("dashboard flusher error")
+
+
+async def dash_ensure(bot):
+    """Create (and pin) the dashboard once per operator; later runs reuse and edit it."""
+    tid = tenant_id()
+    st = DASH.setdefault(tid, {"msg": None, "lock": asyncio.Lock(), "last": 0.0, "text": None, "task": None})
+    if st["msg"] is None:
+        try:
+            msg = await bot.send_message(tid, dash_text(), parse_mode=ParseMode.HTML)
+        except Exception:
+            log.warning("could not create promotion dashboard")
+            return st
+        st["msg"], st["text"] = msg, dash_text()
+        try:
+            old = await db.get_setting("dash_message_id", None)
+            if old and str(old) != str(msg.message_id):
+                await bot.unpin_chat_message(chat_id=tid, message_id=int(old))
+        except Exception:
+            pass
+        try:
+            await bot.pin_chat_message(chat_id=tid, message_id=msg.message_id, disable_notification=True)
+            await db.set_setting("dash_message_id", str(msg.message_id))
+        except Exception:
+            log.warning("could not pin promotion dashboard")
+    if st["task"] is None or st["task"].done():
+        st["task"] = asyncio.create_task(_dash_flusher())
+    return st
+
+
+async def dash_refresh(force=False):
+    st = DASH.get(tenant_id())
+    if not st or st["msg"] is None:
         return
-    metric['last_edit'] = time.monotonic()
-    try:
-        await message.edit_text(account_stats_text(metric), parse_mode=ParseMode.HTML)
-    except BadRequest as exc:
-        if 'not modified' not in str(exc).lower():
-            log.warning('Account progress edit failed: %s', type(exc).__name__)
-    except Exception as exc:
-        log.warning('Account progress edit failed: %s', type(exc).__name__)
+    if not force and time.monotonic() - st["last"] < DASH_EDIT_SECONDS:
+        return
+    async with st["lock"]:
+        text = dash_text()
+        if text == st["text"]:
+            return
+        st["last"] = time.monotonic()
+        try:
+            await st["msg"].edit_text(text, parse_mode=ParseMode.HTML)
+            st["text"] = text
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                log.warning("dashboard edit failed: %s", exc)
+        except Exception as exc:
+            log.warning("dashboard edit failed: %s", type(exc).__name__)
+
+
+async def dash_finish():
+    st = DASH.get(tenant_id())
+    if not st:
+        return
+    if st["task"] and not st["task"].done():
+        st["task"].cancel()
+    st["task"] = None
+    await dash_refresh(force=True)
+
+
+async def edit_account_progress(row, metric, *, force=False):
+    await dash_refresh()          # throttled; the flusher sends the latest state
 
 
 async def send_account_telemetry(update, kind):
@@ -1918,32 +2008,20 @@ async def do_round(app: Application):
         stats.total_groups += len(groups)
         stats.total_users += len(users)
 
-    progress_msg = None
-    try:
-        progress_msg = await app.bot.send_message(tenant_id(), stats_text(), parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    await dash_ensure(app.bot)
 
     edit_lock = asyncio.Lock()
     metrics = {}
     for row, client, groups, users in prepared:
         metric = begin_metric(row, 'promo', len(groups)+len(users), len(groups), len(users))
         metrics[str(row['id'])] = metric
-        try:
-            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
-            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
-        except Exception:
-            pass
+        pass
     async def resume_prepaused(row):
         """Reconnect only this account when a pre-existing FloodWait expires."""
         sid = str(row["id"])
         metric = begin_metric(row, 'promo')
         metrics[sid] = metric
-        try:
-            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
-            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'promo')] = message
-        except Exception:
-            pass
+        pass
         if not await wait_for_flood_release(row, metric):
             return
         try:
@@ -1968,7 +2046,7 @@ async def do_round(app: Application):
         metric["users"] = len(users)
         stats.total_groups += len(groups)
         stats.total_users += len(users)
-        await _run_session_round(row, client, groups, users, posts, mode, progress_msg, edit_lock, metric)
+        await _run_session_round(row, client, groups, users, posts, mode, None, edit_lock, metric)
 
     # Normal and cooling-down accounts have independent concurrent workers.
     # One account finishing or crashing must never stop the other accounts.
@@ -1977,7 +2055,7 @@ async def do_round(app: Application):
         metric = metrics[sid]
         try:
             await _run_session_round(
-                row, client, groups, users, posts, mode, progress_msg, edit_lock, metric
+                row, client, groups, users, posts, mode, None, edit_lock, metric
             )
         except asyncio.CancelledError:
             raise
@@ -2023,11 +2101,7 @@ async def do_round(app: Application):
         if isinstance(result, asyncio.CancelledError):
             raise result
 
-    if progress_msg:
-        try:
-            await progress_msg.edit_text(stats_text(), parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+    await dash_finish()
 
 
 async def run_one_time_dm_broadcast(app: Application):
@@ -2085,22 +2159,14 @@ async def run_one_time_dm_broadcast(app: Application):
         prepared.append((row, client, users))
         stats.total_users += len(users)
 
-    progress_msg = None
-    try:
-        progress_msg = await app.bot.send_message(tenant_id(), "📨 <b>DM BROADCAST STARTED</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    await dash_ensure(app.bot)
 
     edit_lock = asyncio.Lock()
     metrics = {}
     for row, client, users in prepared:
         metric = begin_metric(row, 'dm', len(users), users=len(users))
         metrics[str(row['id'])] = metric
-        try:
-            message = await app.bot.send_message(tenant_id(), account_stats_text(metric), parse_mode=ParseMode.HTML)
-            ACCOUNT_PROGRESS_MESSAGES[metric_key(row['id'], 'dm')] = message
-        except Exception:
-            pass
+        pass
 
     async def worker(row, client, users):
         sid = str(row["id"])
@@ -2179,11 +2245,7 @@ async def run_one_time_dm_broadcast(app: Application):
     await asyncio.gather(*(worker(row, client, users) for row, client, users in prepared))
     stats.current_group = "-"
     stats.current_session = "-"
-    if progress_msg:
-        try:
-            await progress_msg.edit_text("✅ <b>DM BROADCAST COMPLETE</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+    await dash_finish()
 
 
 
