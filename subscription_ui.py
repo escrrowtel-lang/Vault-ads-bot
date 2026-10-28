@@ -359,6 +359,29 @@ async def dash_view(note=""):
     return "\n".join(lines), rows
 
 
+# (name, price in rupees, duration days, accounts). Prices are placeholders; admin edits them per plan.
+STARTER_PLANS = [
+    ("2 Din · 2 Accounts", 19, 2, 2),
+    ("7 Din · 2 Accounts", 49, 7, 2), ("7 Din · 5 Accounts", 99, 7, 5), ("7 Din · 10 Accounts", 179, 7, 10),
+    ("15 Din · 2 Accounts", 79, 15, 2), ("15 Din · 5 Accounts", 149, 15, 5), ("15 Din · 10 Accounts", 269, 15, 10),
+    ("30 Din · 2 Accounts", 129, 30, 2), ("30 Din · 5 Accounts", 249, 30, 5), ("30 Din · 10 Accounts", 449, 30, 10),
+]
+
+
+async def seed_starter_plans() -> tuple[int, int]:
+    """Creates the starter plans. Plans with the same name are skipped, so it is safe to press twice."""
+    existing = {p["name"] for p in await S.run(S.STORE.list_plans)}
+    made = skipped = 0
+    for name, rupees, days, accounts in STARTER_PLANS:
+        if name in existing:
+            skipped += 1
+            continue
+        plan = await S.run(S.STORE.create_plan, name, rupees * 100, days)
+        await S.run(S.STORE.update_plan, plan["plan_id"], max_accounts=accounts, bot_feature=True, ai_feature=True)
+        made += 1
+    return made, skipped
+
+
 async def plans_view():
     plans = await S.run(S.STORE.list_plans)
     lines = ["📦 <b>PLANS</b>", ""]
@@ -369,7 +392,7 @@ async def plans_view():
         rows.append([B(f"{flag} #{p['plan_id']} {p['name']}", f"sadm:pl:{p['plan_id']}")])
     if not plans:
         lines.append("No plans yet. Create one to start selling.")
-    rows += [[B("➕ New Plan", "sadm:pnew")], [B("⬅️ Back", "sadm:home")]]
+    rows += [[B("⚡ Add starter plans", "sadm:seed")], [B("➕ New Plan", "sadm:pnew")], [B("⬅️ Back", "sadm:home")]]
     return "\n".join(lines), rows
 
 
@@ -569,6 +592,11 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             await S.run(S.STORE.set_setting, "support_text", "")
             await S.run(S.STORE.set_setting, "support_username", "")
             return await _edit(q, *await support_admin_view("🗑 Support cleared."))
+        if a == "seed":
+            made, skipped = await seed_starter_plans()
+            await S.run(S.STORE.audit, f"admin:{actor}", "plans_seeded", "-", {"made": made, "skipped": skipped})
+            text, rows = await plans_view()
+            return await _edit(q, f"✅ Starter plans: added <b>{made}</b>, already existed <b>{skipped}</b>.\n\n" + text, rows)
         if a == "logch":
             return await _edit(q, *await logch_view())
         if a == "logset":
