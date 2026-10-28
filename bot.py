@@ -2946,7 +2946,7 @@ async def look_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "adm:emoji":
         text, markup = emoji_view()
     elif data == "adm:btnemoji":
-        text, markup = btn_emoji_view(0)
+        text, markup = btn_emoji_view()
     elif data == "adm:btnemoji":
         text, markup = btn_emoji_view()
     elif data.startswith("bem:p:"):
