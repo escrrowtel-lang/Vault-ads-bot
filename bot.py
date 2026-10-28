@@ -2978,6 +2978,15 @@ class PremiumBot(ExtBot):
             return await super().send_message(chat_id, text, *args, **kwargs)
         return await self._premium_send(super().send_message, dict(kwargs, chat_id=chat_id, text=text))
 
+    async def answer_callback_query(self, *args, **kwargs):
+        """Button acknowledgements are short-lived, so retry briefly and never crash the handler."""
+        call = super().answer_callback_query
+        try:
+            return await _with_network_retry(lambda: call(*args, **kwargs), attempts=2)
+        except NetworkError:
+            log.warning("callback answer dropped (network); the button still works")
+            return False
+
     async def edit_message_text(self, text, *args, **kwargs):
         if args:
             return await super().edit_message_text(text, *args, **kwargs)
