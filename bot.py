@@ -5255,23 +5255,51 @@ async def post_init(app: Application):
             log.warning("Could not set Telegram commands/menu button: %s", e)
 
     # Independent steps run together instead of one after another.
-    await asyncio.gather(
+    # A database outage must not stop the bot: failures are logged and operators retry below.
+    results = await asyncio.gather(
         _timed("telegram commands", _telegram_setup()),
         _timed("look settings", load_look_settings()),
         _timed("co-admins", load_co_admins()),
-        _timed("approved users", load_approved_users()),
         _timed("admin settings", load_admin_settings()),
+        return_exceptions=True,
     )
+    for res in results:
+        if isinstance(res, Exception):
+            log.error("startup step failed: %s", res)
     asyncio.create_task(free_bio_guard_loop(), name="free_bio_guard")
     await _timed("subscriptions", sub_start(app))  # expired users are revoked before listeners start
-    # Owner database and legacy encrypted sessions are never migrated/deleted.
+    asyncio.create_task(_operators_with_retry(app), name="operators_startup")
+
+
+async def start_operators(app: Application) -> bool:
+    """Start every approved operator's services. Returns False if any operator failed."""
+    ok = True
     began = time.monotonic()
     for uid in sorted(APPROVED_USERS):
-        await initialize_tenant(uid)
-        await start_tenant_listener(app, uid)
-        await start_join_queue_service(app, uid)
-        await sync_bot_account_listeners(app, uid)
-    log.info("startup: %d operator(s) ready %.2fs", len(APPROVED_USERS), time.monotonic() - began)
+        try:
+            await initialize_tenant(uid)
+            await start_tenant_listener(app, uid)
+            await start_join_queue_service(app, uid)
+            await sync_bot_account_listeners(app, uid)
+        except Exception:
+            ok = False
+            log.exception("startup: operator %s not ready yet", uid)
+    log.info("startup: %d operator(s) checked %.2fs", len(APPROVED_USERS), time.monotonic() - began)
+    return ok
+
+
+async def _operators_with_retry(app: Application):
+    """Retries operator startup every 60s until the database answers; the bot keeps running meanwhile."""
+    while True:
+        try:
+            await load_approved_users()
+            if await start_operators(app):
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("startup: database not ready (%s); retrying in 60s", type(exc).__name__)
+        await asyncio.sleep(60)
 
 
 async def post_shutdown(app: Application):
