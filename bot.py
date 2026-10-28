@@ -2527,6 +2527,8 @@ async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("That user is not approved.")
     await subs_core.log_event(f"🚫 Operator removed · <code>{uid}</code> · by owner")
     APPROVED_USERS.discard(uid)  # Reject new actions before stopping existing jobs.
+    if CO_ADMINS.pop(uid, None) is not None:
+        await save_co_admins()
     await asyncio.to_thread(operator_access.delete_one, {"_id": uid})
     st = tenant_stats(uid)
     st.running = False
@@ -2572,6 +2574,8 @@ async def sub_revoke_access(app: Application, uid: int):
     if uid == ADMIN_ID or uid not in APPROVED_USERS:
         return
     APPROVED_USERS.discard(uid)  # Reject new actions before stopping existing jobs.
+    if CO_ADMINS.pop(uid, None) is not None:
+        await save_co_admins()
     await asyncio.to_thread(operator_access.delete_one, {"_id": uid})
     st = tenant_stats(uid)
     st.running = False
@@ -2632,7 +2636,7 @@ def main_markup(uid: int):
         btns = [styled_button(_menu_label(k), k) for k in row if not _menu_hidden(k)]
         if btns:
             rows.append(btns)
-    if uid == ADMIN_ID:
+    if can_open_panel(uid):
         rows.append([styled_button(_menu_label("adm:home"), "adm:home")])
     if not _menu_hidden("sub:home"):
         rows.append([InlineKeyboardButton(_menu_label("sub:home"), callback_data="sub:home",
@@ -3563,6 +3567,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = state.get(uid)
     if isinstance(current, str) and (current.startswith(("await_menu_label:", "await_btn_emoji:")) or current == "await_premium_emoji"):
         return await look_text_input(update, uid, current, text)
+    if current == "await_coadmin":
+        return await coadmin_text(update, uid, text)
     if current in ("await_front_text", "await_free_tag"):
         return await look_text_input(update, uid, current, text)
     if current in ("await_groq_key", "await_ai_profile"):
@@ -4803,6 +4809,120 @@ async def delete_undecryptable() -> tuple[int, int]:
     return accounts, bots
 
 
+# ---- Co-admins: owner grants sections from the admin panel. Look & Emoji, Maintenance,
+# log channel and co-admin management stay with the owner. A co-admin must stay approved.
+CO_ADMIN_SECTIONS = {"users": "Users", "subs": "Subs & Pay", "bc": "Broadcast", "acct": "Account Status"}
+CO_ADMINS: dict[int, set] = {}
+ADMIN_ACTION_SECTION = {"home": "any", "back": "any", "users": "users",
+                        "acc": "acct", "cleanpre": "acct", "cleanok": "acct"}
+
+
+def can(uid: int, section: str) -> bool:
+    if uid == ADMIN_ID:
+        return True
+    return uid in APPROVED_USERS and section in CO_ADMINS.get(uid, set())
+
+
+def can_open_panel(uid: int) -> bool:
+    return uid == ADMIN_ID or any(can(uid, s) for s in CO_ADMIN_SECTIONS)
+
+
+def admin_action_allowed(uid: int, action: str) -> bool:
+    sec = ADMIN_ACTION_SECTION.get(action, "owner")
+    if sec == "any":
+        return can_open_panel(uid)
+    if sec == "owner":
+        return uid == ADMIN_ID
+    return can(uid, sec)
+
+
+async def save_co_admins():
+    await tenant_db(ADMIN_ID).set_setting(
+        "co_admins", json.dumps({str(k): sorted(v) for k, v in CO_ADMINS.items() if v}))
+
+
+async def load_co_admins():
+    try:
+        raw = await tenant_db(ADMIN_ID).get_setting("co_admins", "{}")
+        CO_ADMINS.clear()
+        for k, v in json.loads(raw or "{}").items():
+            CO_ADMINS[int(k)] = set(v)
+    except Exception:
+        log.warning("could not load co-admins; none active")
+
+
+def co_admin_view(note=""):
+    lines = ["👮 <b>CO-ADMINS</b>", "",
+             "Owner grants sections to an approved user. Look &amp; Emoji, Maintenance and this page stay with the owner.", ""]
+    rows = []
+    if not CO_ADMINS:
+        lines.append("No co-admins yet.")
+    for uid in sorted(CO_ADMINS):
+        secs = CO_ADMINS[uid]
+        names = ", ".join(v for s, v in CO_ADMIN_SECTIONS.items() if s in secs) or "no sections"
+        flag = "" if uid in APPROVED_USERS else " (not approved now)"
+        lines.append(f"• <code>{uid}</code>{flag} · {names}")
+        rows.append([InlineKeyboardButton(("✅ " if s in secs else "⬜ ") + label,
+                                          callback_data=f"coa:t:{uid}:{s}")
+                     for s, label in CO_ADMIN_SECTIONS.items()])
+        rows.append([InlineKeyboardButton(f"🗑 Remove {uid}", callback_data=f"coa:r:{uid}")])
+    rows.append([InlineKeyboardButton("➕ Add co-admin", callback_data="coa:add")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:home")])
+    head = (note + "\n\n") if note else ""
+    return head + "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def co_admin_callback(update, context):
+    q = update.callback_query
+    if not q.from_user or q.from_user.id != ADMIN_ID:
+        return await q.answer("⛔ Owner only", show_alert=True)
+    await q.answer()
+    parts = q.data.split(":")
+    act = parts[1] if len(parts) > 1 else "list"
+    note = ""
+    if act == "add":
+        state[q.from_user.id] = "await_coadmin"
+        return await q.edit_message_text(
+            "➕ Send the Telegram user ID of an approved user to make co-admin.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="coa:list")]]))
+    if act == "t" and len(parts) == 4:
+        uid, sec = int(parts[2]), parts[3]
+        if sec in CO_ADMIN_SECTIONS:
+            secs = CO_ADMINS.setdefault(uid, set())
+            secs.symmetric_difference_update({sec})
+            if not secs:
+                CO_ADMINS.pop(uid, None)
+            await save_co_admins()
+    elif act == "r" and len(parts) == 3:
+        CO_ADMINS.pop(int(parts[2]), None)
+        await save_co_admins()
+        note = "🗑 Removed."
+    text, markup = co_admin_view(note)
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            log.warning("co-admin view failed: %s", exc)
+
+
+async def coadmin_text(update, uid: int, text: str):
+    try:
+        target = int((text or "").strip())
+    except ValueError:
+        return await update.message.reply_text("❌ Send a numeric Telegram user ID.")
+    if target == ADMIN_ID:
+        state.pop(uid, None)
+        return await update.message.reply_text("The owner already has every section.")
+    if target not in APPROVED_USERS:
+        return await update.message.reply_text(
+            "❌ That user is not approved yet. Approve them first, then try again.")
+    CO_ADMINS.setdefault(target, set())
+    await save_co_admins()
+    state.pop(uid, None)
+    out, markup = co_admin_view(f"✅ {target} added. Tap the sections to allow.")
+    await update.message.reply_text(out, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
 def admin_markup():
     m = "ON 🔴" if MAINTENANCE["on"] else "OFF 🟢"
     return InlineKeyboardMarkup([
@@ -4810,6 +4930,7 @@ def admin_markup():
         [styled_button("📡 Account Status", "adm:acc")],
         [styled_button("🎨 Look & Emoji", "adm:look")],
         [styled_button("👥 Approved Users", "adm:users")],
+        [styled_button("👮 Co-Admins", "coa:list")],
         [styled_button("💎 Subscriptions", "sadm:home")],  # NEW
         [styled_button("⬅️ Back", "adm:back")],
     ])
@@ -4817,10 +4938,12 @@ def admin_markup():
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not query.from_user or query.from_user.id != ADMIN_ID:
+    if not query.from_user or not can_open_panel(query.from_user.id):
         return await query.answer("⛔ Admin only", show_alert=True)
-    await query.answer()
     action = query.data.split(":", 1)[1]
+    if not admin_action_allowed(query.from_user.id, action):
+        return await query.answer("⛔ Your admin access does not include this section.", show_alert=True)
+    await query.answer()
     text = "🛡 <b>ADMIN PANEL</b>\n\nManage access and bot-wide settings."
     if action == "maint":
         MAINTENANCE["on"] = not MAINTENANCE["on"]
@@ -5027,6 +5150,7 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def post_init(app: Application):
     await load_look_settings()
+    await load_co_admins()
     asyncio.create_task(free_bio_guard_loop(), name="free_bio_guard")
     # Hide Telegram's bottom-left 'Menu' button: no bot command list is registered,
     # so the commands-type menu button has nothing to show.
@@ -5144,6 +5268,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back|acc|cleanpre|cleanok)$"))
+    app.add_handler(CallbackQueryHandler(co_admin_callback, pattern=r"^coa:"))
     app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji|front|fbio)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+)|frt:[er]|fbio:(?:t|tg|run))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
@@ -5157,6 +5282,7 @@ def main():
     # A stranger messaging the control bot receives a cooldown-limited response.
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, authorized_handler(bot_dm_auto_reply)), group=2)
     subs_ui.configure(ADMIN_ID, APPROVED_USERS, _sub_back_to_main)   # NEW
+    subs_ui.CFG["can"] = can
     subs_ui.register_handlers(app)                                    # NEW
     app.add_error_handler(error_handler)
     log.info("Starting Telegram polling")

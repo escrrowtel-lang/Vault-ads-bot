@@ -309,6 +309,52 @@ def _is_admin(user) -> bool:
     return bool(user and user.id == CFG["admin_id"])
 
 
+# Co-admin sections. Owner-only unless listed here. "any" = needs only panel access.
+SADM_SECTION = {
+    "home": "any", "dash": "any", "cancel": "any",
+    "users": "users", "find": "users", "su": "users",
+    "pl": "subs", "plans": "subs", "pnew": "subs", "pt": "subs", "pf": "subs", "pe": "subs",
+    "seed": "subs", "pay": "subs", "pd": "subs", "pr": "subs", "subs": "subs", "sv": "subs",
+    "svy": "subs", "sx": "subs", "exp": "subs", "sweep": "subs", "sync": "subs", "trial": "subs",
+    "extend": "subs", "audit": "subs",
+    "bc": "bc", "bcgo": "bc", "sup": "bc", "supt": "bc", "supu": "bc", "supclr": "bc",
+}
+# Text-input steps (the act stored in the flow state).
+SADM_TEXT_SECTION = {
+    "pnew_name": "subs", "pnew_price": "subs", "pnew_days": "subs", "extend": "subs",
+    "find": "users", "bc_wait": "bc", "bc_confirm": "bc", "sup_text": "bc", "sup_user": "bc",
+}
+
+
+def _can(uid: int, section: str) -> bool:
+    check = CFG.get("can")
+    if check is not None:
+        return bool(check(uid, section))
+    return uid == CFG["admin_id"]
+
+
+def _can_open(user) -> bool:
+    return bool(user) and any(_can(user.id, s) for s in ("users", "subs", "bc"))
+
+
+def _button_allowed(uid: int, action: str) -> bool:
+    sec = SADM_SECTION.get(action, "owner")
+    if sec == "any":
+        return any(_can(uid, s) for s in ("users", "subs", "bc"))
+    if sec == "owner":
+        return uid == CFG["admin_id"]
+    return _can(uid, sec)
+
+
+def _text_allowed(uid: int, act: str) -> bool:
+    if act.startswith("pedit_"):
+        return _can(uid, "subs")
+    sec = SADM_TEXT_SECTION.get(act, "owner")
+    if sec == "owner":
+        return uid == CFG["admin_id"]
+    return _can(uid, sec)
+
+
 def _paged(prefix, page, total, size=S.PAGE_SIZE):
     row = []
     if page > 0:
@@ -563,7 +609,7 @@ async def logch_view(note=""):
 
 async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not _is_admin(q.from_user):
+    if not _can_open(q.from_user):
         return await q.answer("⛔ Admin only", show_alert=True)
     if not q.message or q.message.chat.type != "private":
         return await q.answer()
@@ -571,6 +617,8 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         return await q.answer("Subscription service is not running (check logs).", show_alert=True)
     parts = q.data.split(":")
     a = parts[1] if len(parts) > 1 else "home"
+    if not _button_allowed(q.from_user.id, a):
+        return await q.answer("⛔ Your admin access does not include this section.", show_alert=True)
     actor = q.from_user.id
     try:
         await q.answer()
@@ -723,7 +771,7 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
     """Text input for admin flows. Consumes the message only while a flow is active."""
     user = update.effective_user
     msg = update.message
-    if not _is_admin(user) or not msg or not S.STORE:
+    if not _can_open(user) or not msg or not S.STORE:
         return
     st = ctx.user_data.get("sadm")
     if not st:
@@ -732,6 +780,8 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("sadm", None)
         return
     act = st["act"]
+    if not _text_allowed(user.id, act):
+        return
     if act in ("bc_wait", "bc_confirm", "wm_text"):
         try:
             text, rows = await _admin_special(ctx, msg, st, user)
