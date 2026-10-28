@@ -410,7 +410,8 @@ TENANT_DB: dict[int, Database] = {}
 TENANT_SESSIONS: dict[int, MongoSessionStore] = {}
 TENANT_STATS: dict[int, RuntimeStats] = {}
 PROMO_TASKS: dict[int, asyncio.Task] = {}
-KEY_MISMATCH_LOGGED: set[str] = set()     # accounts already reported for an undecryptable session
+BOT_KEY_BLOCKED: dict[tuple[int, int], float] = {}   # bot listeners waiting out an undecryptable token
+KEY_MISMATCH_LOGGED: set = set()     # accounts already reported for an undecryptable session
 LISTENER_TASKS: dict[int, asyncio.Task] = {}
 JOIN_QUEUE_TASKS: dict[int, asyncio.Task] = {}
 BOT_ACCOUNT_TASKS: dict[tuple[int, int], asyncio.Task] = {}
@@ -965,7 +966,15 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
         raise
     except Exception as exc:
         BOT_ACCOUNT_STATUS[key] = f"🔴 ERROR {type(exc).__name__}"
-        log.warning("Bot account failed owner=%s bot_id=%s: %s: %s", owner_uid, bot_id, type(exc).__name__, exc)
+        if "FERNET_KEY" in str(exc):
+            # Token saved with an old key: wait an hour before trying again instead of every sync.
+            BOT_KEY_BLOCKED[key] = time.monotonic() + 3600
+            if key not in KEY_MISMATCH_LOGGED:
+                KEY_MISMATCH_LOGGED.add(key)
+                log.error("Bot account %s: token cannot be decrypted with the current FERNET_KEY. "
+                          "Restore the old key, or remove and add this bot again.", bot_id)
+        else:
+            log.warning("Bot account failed owner=%s bot_id=%s: %s: %s", owner_uid, bot_id, type(exc).__name__, exc)
     finally:
         if api_bot is not None:
             try:
@@ -980,6 +989,8 @@ async def start_bot_account_listener(app: Application, owner_uid: int, bot_id: i
     key = (int(owner_uid), int(bot_id))
     old = BOT_ACCOUNT_TASKS.get(key)
     if old and not old.done():
+        return
+    if time.monotonic() < BOT_KEY_BLOCKED.get(key, 0):
         return
     BOT_ACCOUNT_TASKS[key] = asyncio.create_task(
         _bot_account_listener(app, owner_uid, bot_id),
