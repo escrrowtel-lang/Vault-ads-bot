@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from types import SimpleNamespace
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonCommands, MessageEntity, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
 from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
@@ -5096,10 +5097,13 @@ def start_health_server():
 
 def main():
     start_health_server()
-    # Slow networks on new hosts caused startup timeouts; allow longer waits.
-    app = (Application.builder().bot(PremiumBot(BOT_TOKEN)).post_init(post_init).post_shutdown(post_shutdown)
-           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
-           .get_updates_connect_timeout(30).get_updates_read_timeout(60).build())
+    # Slow networks on new hosts caused startup timeouts; timeouts live on the request objects.
+    bot = PremiumBot(
+        BOT_TOKEN,
+        request=HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30),
+        get_updates_request=HTTPXRequest(connect_timeout=30, read_timeout=60, write_timeout=30, pool_timeout=30),
+    )
+    app = Application.builder().bot(bot).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("add", add_operator))
     app.add_handler(CommandHandler("rem", remove_operator))
     app.add_handler(CommandHandler("users", list_operators))
