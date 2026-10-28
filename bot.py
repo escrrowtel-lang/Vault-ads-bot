@@ -2695,7 +2695,7 @@ MENU_ITEMS = [
 MENU_DEFAULTS = dict(MENU_ITEMS)
 MENU_LAYOUT = [["main:promotion"], ["main:posts", "main:accounts"], ["main:autoreply", "main:bio"], ["main:monitoring"]]
 # menu: callback -> {"label": str (optional), "hidden": bool (optional)}; premium_map: normal emoji -> custom emoji id
-LOOK = {"menu": {}, "premium_on": False, "premium_map": {}}
+LOOK = {"menu": {}, "premium_on": False, "premium_map": {}, "button_icons": {}}
 
 
 async def load_look_settings():
@@ -2707,6 +2707,7 @@ async def load_look_settings():
         data = json.loads(raw) if raw else {}
         LOOK["premium_on"] = bool(data.get("on"))
         LOOK["premium_map"] = dict(data.get("map") or {})
+        LOOK["button_icons"] = dict(data.get("buttons") or {})
     except (TypeError, ValueError):
         log.warning("could not parse look settings; using defaults")
 
@@ -2714,7 +2715,7 @@ async def load_look_settings():
 async def save_look_settings():
     adb = tenant_db(ADMIN_ID)
     await adb.set_setting("menu_overrides", json.dumps(LOOK["menu"], ensure_ascii=False))
-    await adb.set_setting("premium_emoji", json.dumps({"on": LOOK["premium_on"], "map": LOOK["premium_map"]}, ensure_ascii=False))
+    await adb.set_setting("premium_emoji", json.dumps({"on": LOOK["premium_on"], "map": LOOK["premium_map"], "buttons": LOOK["button_icons"]}, ensure_ascii=False))
 
 
 def _menu_label(key):
@@ -2755,20 +2756,32 @@ def _premium_text(text, mode):
     return text, None
 
 
+def _all_button_labels():
+    """Every button label used in the bot's menus (current text), in first-seen order."""
+    markups = [v for v in list(globals().values()) if isinstance(v, InlineKeyboardMarkup)]
+    markups.append(main_markup(ADMIN_ID))
+    markups.append(admin_markup())
+    labels = []
+    for m in markups:
+        for row in m.inline_keyboard:
+            for b in row:
+                if b.text and b.text not in labels:
+                    labels.append(b.text)
+    return labels
+
+
 def _premium_markup(markup):
-    """Adds the mapped premium emoji as the icon of a button; the label text is never changed."""
-    if not isinstance(markup, InlineKeyboardMarkup) or not LOOK["premium_map"]:
+    """Adds the admin-chosen premium emoji as the icon of matching buttons. Label text is never changed."""
+    if not isinstance(markup, InlineKeyboardMarkup) or not LOOK["button_icons"]:
         return markup
-    keys = sorted(LOOK["premium_map"], key=len, reverse=True)
     rows = []
     for row in markup.inline_keyboard:
         new_row = []
         for btn in row:
-            txt = btn.text or ""
-            k = next((k for k in keys if txt.startswith(k)), None)
-            if k and len(txt) > len(k):
+            eid = LOOK["button_icons"].get(btn.text or "")
+            if eid:
                 d = btn.to_dict()
-                d["icon_custom_emoji_id"] = LOOK["premium_map"][k]
+                d["icon_custom_emoji_id"] = eid
                 new_row.append(InlineKeyboardButton.de_json(d, None))
             else:
                 new_row.append(btn)
@@ -2796,11 +2809,11 @@ class PremiumBot(ExtBot):
         return await self._premium_send(super().send_photo, dict(kwargs, photo=photo))
 
     async def _premium_send(self, method, kw):
-        if not LOOK["premium_on"] or not LOOK["premium_map"]:
+        if not LOOK["premium_on"]:
             return await method(**kw)
         new = dict(kw)
         key = "text" if "text" in kw else ("caption" if "caption" in kw else None)
-        if key and isinstance(kw[key], str) and kw.get("entities") is None and kw.get("caption_entities") is None:
+        if key and LOOK["premium_map"] and isinstance(kw[key], str) and kw.get("entities") is None and kw.get("caption_entities") is None:
             new[key], ents = _premium_text(kw[key], kw.get("parse_mode"))
             if ents:
                 new["entities" if key == "text" else "caption_entities"] = ents
@@ -2851,6 +2864,35 @@ def menu_item_view(idx, note=""):
     return text, InlineKeyboardMarkup(rows)
 
 
+BTN_PAGE = 8
+
+
+def btn_emoji_view(page=0, note=""):
+    labels = _all_button_labels()
+    icons = LOOK["button_icons"]
+    total = len(labels)
+    pages = max(1, (total + BTN_PAGE - 1) // BTN_PAGE)
+    page = min(max(page, 0), pages - 1)
+    lines = ["🎛 <b>BUTTON PREMIUM EMOJI</b>", "",
+             "Tap a button, then send a message that has the premium emoji. The button name stays the same.",
+             "Premium emoji is shown only if the button icon feature is ON (💠 Premium Emoji → Toggle).", "",
+             f"Set: <b>{len(icons)}</b> of {total} buttons · page {page + 1}/{pages}"]
+    rows = []
+    for i in range(page * BTN_PAGE, min(total, (page + 1) * BTN_PAGE)):
+        lbl = labels[i]
+        mark = "✅" if lbl in icons else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {lbl[:30]}", callback_data=f"bem:p:{i}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"bem:pg:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"bem:pg:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:emoji")])
+    return (note + "\n\n" if note else "") + "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
 def emoji_view(note=""):
     on, m = LOOK["premium_on"], LOOK["premium_map"]
     lines = ["💠 <b>PREMIUM EMOJI</b>", "",
@@ -2858,7 +2900,8 @@ def emoji_view(note=""):
              "Users with Telegram Premium see the premium version; others see the normal emoji.", "",
              f"Status: <b>{'ON 🟢' if on else 'OFF 🔴'}</b>", f"Mapped: <b>{len(m)}</b>", ""]
     rows = [[InlineKeyboardButton("🔁 Turn " + ("OFF" if on else "ON"), callback_data="emj:toggle")],
-            [InlineKeyboardButton("➕ Add premium emoji", callback_data="emj:add")]]
+            [InlineKeyboardButton("➕ Add premium emoji", callback_data="emj:add")],
+            [InlineKeyboardButton("🎛 Button Emoji", callback_data="adm:btnemoji")]]
     if not m:
         lines.append("No mappings yet. Tap ➕ Add, then send one message that contains a premium emoji.")
     for n, (base, eid) in enumerate(list(m.items())[:30]):
@@ -2881,6 +2924,28 @@ async def look_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = menu_editor_view()
     elif data == "adm:emoji":
         text, markup = emoji_view()
+    elif data == "adm:btnemoji":
+        text, markup = btn_emoji_view(0)
+    elif data.startswith("bem:pg:"):
+        text, markup = btn_emoji_view(int(data.split(":")[2]))
+    elif data.startswith("bem:p:"):
+        i = int(data.split(":")[2])
+        labels = _all_button_labels()
+        if 0 <= i < len(labels):
+            lbl = labels[i]
+            state[uid] = f"await_btn_emoji:{i}"
+            text = f"🎛 Send a message with the premium emoji for <b>{esc(lbl)}</b>."
+            back = [InlineKeyboardButton("❌ Cancel", callback_data="bem:pg:0")]
+            rows = [back] if lbl not in LOOK["button_icons"] else [
+                [InlineKeyboardButton("🗑 Remove premium emoji", callback_data=f"bem:x:{i}")], back]
+            markup = InlineKeyboardMarkup(rows)
+    elif data.startswith("bem:x:"):
+        i = int(data.split(":")[2])
+        labels = _all_button_labels()
+        if 0 <= i < len(labels):
+            LOOK["button_icons"].pop(labels[i], None)
+            await save_look_settings()
+            text, markup = btn_emoji_view(0, "🗑 Removed.")
     elif data.startswith("mnu:"):
         _, act, sidx = data.split(":")
         idx = int(sidx)
@@ -2951,6 +3016,18 @@ async def look_text_input(update: Update, uid: int, current: str, text: str):
             LOOK["menu"].pop(k, None)
         await save_look_settings()
         t, m = menu_editor_view("✅ Label updated.")
+        return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+    if current.startswith("await_btn_emoji:"):
+        i = int(current.split(":", 1)[1])
+        labels = _all_button_labels()
+        eid = next((e.custom_emoji_id for e in (msg.entities or [])
+                    if e.type == "custom_emoji" and getattr(e, "custom_emoji_id", None)), None)
+        if not eid or not 0 <= i < len(labels):
+            state[uid] = current
+            return await msg.reply_text("❌ No premium emoji in that message. Send one that has a premium emoji, or tap ❌ Cancel.")
+        LOOK["button_icons"][labels[i]] = eid
+        await save_look_settings()
+        t, m = btn_emoji_view(i // BTN_PAGE, f"✅ Premium emoji set for {labels[i]}.")
         return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
     # await_premium_emoji
     found = {}
@@ -3131,7 +3208,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Auto-reply submenu: always process Back before text input.
     current = state.get(uid)
-    if isinstance(current, str) and (current.startswith("await_menu_label:") or current == "await_premium_emoji"):
+    if isinstance(current, str) and (current.startswith(("await_menu_label:", "await_btn_emoji:")) or current == "await_premium_emoji"):
         return await look_text_input(update, uid, current, text)
     if current in ("await_groq_key", "await_ai_profile"):
         return await ai_text_input(update, uid, current, text)
@@ -4533,7 +4610,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back)$"))
-    app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+))$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:pg:\d+|p:\d+|x:\d+))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
