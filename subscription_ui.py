@@ -33,7 +33,14 @@ def h(x) -> str:
 
 
 def B(label: str, data: str) -> InlineKeyboardButton:
+    if data.startswith("sub:") and "Back" not in label:      # subscription buttons are red
+        return InlineKeyboardButton(label, callback_data=data, api_kwargs={"style": "danger"})
     return InlineKeyboardButton(label, callback_data=data)
+
+
+def _caps_text(caps) -> str:
+    accts = "unlimited" if caps["max_accounts"] is None else str(caps["max_accounts"])
+    return f"{accts} account(s) · 🤖 Bot {'✅' if caps['bot'] else '❌'} · 🧠 AI {'✅' if caps['ai'] else '❌'}"
 
 
 async def _edit(q, text, rows):
@@ -97,7 +104,8 @@ async def home_view(uid: int):
     if not plans:
         lines.append("No plans are available right now. Please contact the owner.")
     for p in plans:
-        lines.append(f"• <b>{h(p['name'])}</b> — {S.fmt_inr(p['price_paise'])} for {p['duration_days']} days")
+        lines.append(f"• <b>{h(p['name'])}</b> — {S.fmt_inr(p['price_paise'])} for {p['duration_days']} days\n"
+                     f"   {_caps_text(S.caps_for_plan(p))}")
         rows.append([B(f"{S.fmt_inr(p['price_paise'])} · {p['name']} · {p['duration_days']}d", f"sub:plan:{p['plan_id']}")])
     if not S.payments_configured():
         lines += ["", "⚠️ Online payments are not enabled yet."]
@@ -131,10 +139,10 @@ def payment_view(doc):
         if doc.get("fulfillment") == "done":
             return head + "\n✅ Payment verified and your subscription is active.", [[B("📊 My Subscription", "sub:my")], [B("⬅️ Back", "sub:back")]]
         return head + "\n✅ Payment verified — activating your access…", [[B("🔄 Check Status", f"sub:chk:{ref}")]]
-    if st == "created" and doc.get("short_url"):
-        return (head + f"\nPay within ~{S.LINK_EXPIRY_MINUTES} minutes using the button below. "
+    if st == "created":
+        return (head + "\nTap <b>Pay via UPI QR</b> and scan the code with any UPI app. "
                        "Access activates automatically once the payment is verified.",
-                [[InlineKeyboardButton("💳 Pay Now", url=doc["short_url"])], [B("📱 Pay via UPI QR", f"sub:qr:{ref}")],
+                [[B("📱 Pay via UPI QR", f"sub:qr:{ref}")],
                  [B("🔄 I've Paid — Check Status", f"sub:chk:{ref}")],
                  [B("❌ Cancel Payment", f"sub:cxl:{ref}")], [B("⬅️ Back", "sub:home")]])
     msg = {"expired": "This payment link expired. Start a new payment from the plans list.",
@@ -162,6 +170,8 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "trial":
             await q.answer()
             ok, msg = await S.start_trial(user.id, user.first_name or "")
+            if ok:
+                msg += "\n\n👥 Free trial: 1 account. Bot and AI features are not included."
             rows = [[B("🚀 Open bot", "sub:back")]] if ok else [[B("💎 Plans", "sub:home")], [B("⬅️ Back", "sub:back")]]
             return await _edit(q, msg, rows)
         if action == "home":
@@ -335,14 +345,20 @@ async def plan_view(pid, note=""):
     p = await S.run(S.STORE.get_plan, pid)
     if not p:
         return "Plan not found.", [[B("⬅️ Back", "sadm:plans")]]
+    caps = S.caps_for_plan(p)
     text = (f"📦 <b>Plan #{p['plan_id']}: {h(p['name'])}</b>\n\nPrice: <b>{S.fmt_inr(p['price_paise'])}</b>\n"
-            f"Duration: <b>{p['duration_days']} days</b>\nStatus: {'🟢 Enabled' if p['enabled'] else '🔴 Disabled'}\n\n"
+            f"Duration: <b>{p['duration_days']} days</b>\nAccounts: <b>{'unlimited' if caps['max_accounts'] is None else caps['max_accounts']}</b>\n"
+            f"Bot feature: <b>{'ON' if caps['bot'] else 'OFF'}</b> · AI auto reply: <b>{'ON' if caps['ai'] else 'OFF'}</b>\n"
+            f"Status: {'🟢 Enabled' if p['enabled'] else '🔴 Disabled'}\n\n"
             "Price/duration changes apply to new purchases only; payments already started keep their original amount.")
     if note:
         text = note + "\n\n" + text
     pid = p["plan_id"]
     rows = [[B("✏️ Name", f"sadm:pe:{pid}:name"), B("💰 Price", f"sadm:pe:{pid}:price")],
             [B("⏳ Duration", f"sadm:pe:{pid}:days"), B("🔴 Disable" if p["enabled"] else "🟢 Enable", f"sadm:pt:{pid}")],
+            [B("👥 Accounts", f"sadm:pe:{pid}:accounts")],
+            [B(f"🤖 Bot: {'ON' if caps['bot'] else 'OFF'}", f"sadm:pf:{pid}:bot"),
+             B(f"🧠 AI: {'ON' if caps['ai'] else 'OFF'}", f"sadm:pf:{pid}:ai")],
             [B("⬅️ Back", "sadm:plans")]]
     return text, rows
 
@@ -504,8 +520,16 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if a == "pe":
             field = parts[3]
             ask = {"name": "Send the new plan name:", "price": "Send the new price in rupees (e.g. 199):",
-                   "days": "Send the new duration in days (e.g. 30):"}[field]
+                   "days": "Send the new duration in days (e.g. 30):",
+                   "accounts": "Send how many Telegram accounts this plan allows (1–500):"}[field]
             return await _edit(q, *_prompt(ctx, "pedit_" + field, "✏️ " + ask, pid=parts[2]))
+        if a == "pf":
+            p = await S.run(S.STORE.get_plan, parts[2])
+            if p and parts[3] in ("bot", "ai"):
+                key = {"bot": "bot_feature", "ai": "ai_feature"}[parts[3]]
+                await S.run(S.STORE.update_plan, parts[2], **{key: not S.caps_for_plan(p)[parts[3]]})
+                await S.run(S.STORE.audit, f"admin:{actor}", "plan_feature", parts[2], {key: not S.caps_for_plan(p)[parts[3]]})
+            return await _edit(q, *await plan_view(parts[2]))
         if a == "pt":
             p = await S.run(S.STORE.get_plan, parts[2])
             if p:
@@ -640,8 +664,9 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
             text, rows = await plan_view(plan["plan_id"], "✅ Plan created and enabled.")
         elif act.startswith("pedit_"):
             field = act[6:]
-            val = {"name": S.parse_name, "price": S.parse_price_paise, "days": S.parse_days}[field](txt)
-            key = {"name": "name", "price": "price_paise", "days": "duration_days"}[field]
+            val = {"name": S.parse_name, "price": S.parse_price_paise, "days": S.parse_days,
+                   "accounts": S.parse_accounts}[field](txt)
+            key = {"name": "name", "price": "price_paise", "days": "duration_days", "accounts": "max_accounts"}[field]
             await S.run(S.STORE.update_plan, st["pid"], **{key: val})
             ctx.user_data.pop("sadm", None)
             await S.run(S.STORE.audit, f"admin:{actor}", "plan_edit", st["pid"], {field: val})

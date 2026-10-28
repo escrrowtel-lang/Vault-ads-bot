@@ -32,6 +32,8 @@ STALE_LOCK_SECONDS = 300
 REMINDER_DAYS = 3
 SWEEP_SECONDS = 60
 PAGE_SIZE = 8
+# Free trial limits: 1 account, no Bot feature, no AI auto reply.
+TRIAL_CAPS = {"max_accounts": 1, "bot": False, "ai": False}
 TRIAL_DAYS = 7                    # free trial length for every new user (one per Telegram user)
 
 
@@ -90,6 +92,23 @@ def parse_price_paise(text: str) -> int:
     if not 100 <= paise <= 50_000_000:
         raise ValueError("Price must be between ₹1 and ₹500000.")
     return paise
+
+
+def caps_for_plan(plan) -> dict:
+    """Limits of a stored plan. Missing fields on older plans mean no limit / features on."""
+    mx = plan.get("max_accounts")
+    return {"max_accounts": None if mx is None else int(mx),
+            "bot": bool(plan.get("bot_feature", True)), "ai": bool(plan.get("ai_feature", True))}
+
+
+def parse_accounts(text: str) -> int:
+    try:
+        n = int((text or "").strip())
+    except ValueError:
+        raise ValueError("Enter a whole number, e.g. 5.")
+    if not 1 <= n <= 500:
+        raise ValueError("Accounts must be between 1 and 500.")
+    return n
 
 
 def parse_days(text: str) -> int:
@@ -160,6 +179,7 @@ class Store:
                                                 upsert=True, return_document=ReturnDocument.AFTER)["seq"]
         doc = {"owner_id": self.owner_id, "plan_id": str(seq), "plan_no": int(seq), "name": name,
                "price_paise": int(price_paise), "duration_days": int(days), "enabled": True,
+               "max_accounts": 5, "bot_feature": True, "ai_feature": True,
                "created_at": now_utc(), "updated_at": now_utc()}
         self.plans.insert_one(doc)
         return doc

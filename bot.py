@@ -2548,7 +2548,8 @@ def main_markup(uid: int):
     if uid == ADMIN_ID:
         rows.append([styled_button(_menu_label("adm:home"), "adm:home")])
     if not _menu_hidden("sub:home"):
-        rows.append([styled_button(_menu_label("sub:home"), "sub:home")])
+        rows.append([InlineKeyboardButton(_menu_label("sub:home"), callback_data="sub:home",
+                                          api_kwargs={"style": "danger"} if BUTTON_STYLES else None)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2812,6 +2813,59 @@ def _premium_markup(markup):
     return InlineKeyboardMarkup(rows)
 
 
+# ---- Plan limits: free trial vs admin-set plans
+BOT_BUTTON_TEXTS = {"🤖 Bot Accounts", "👤 Bot Accounts", "➕ Add Bot", "📊 Bot Stats", "📜 Bot Logs",
+                    "🟢 Toggle Bot Auto Reply", "🟢 Toggle Group Reply", "⏱ Bot Reply Cooldown", "🗑 Remove Bot"}
+AI_BUTTON_TEXTS = {"🤖 AI Mode", "🔑 Groq API Key", "📚 AI Profile", "✅ I Accept These Rules"}
+LOCKED_TEXT = "🔒 This feature is not included in your current plan. Ask the admin to upgrade."
+_caps_cache: dict[int, tuple[float, dict]] = {}
+FULL_CAPS = {"max_accounts": None, "bot": True, "ai": True}
+
+
+async def plan_caps(uid: int) -> dict:
+    if uid == ADMIN_ID or subs_core.STORE is None:
+        return dict(FULL_CAPS)
+    hit = _caps_cache.get(uid)
+    if hit and time.time() - hit[0] < 30:
+        return hit[1]
+    try:
+        sub = await subs_core.run(subs_core.STORE.get_sub, uid)
+        if sub is None:                       # admin-approved without a subscription
+            caps = dict(FULL_CAPS)
+        elif sub.get("status") != "active" or subs_core._aware(sub["expires_at"]) <= subs_core.now_utc():
+            caps = dict(subs_core.TRIAL_CAPS)
+        elif sub.get("plan_id") == "trial":
+            caps = dict(subs_core.TRIAL_CAPS)
+        else:
+            plan = await subs_core.run(subs_core.STORE.get_plan, sub.get("plan_id"))
+            caps = subs_core.caps_for_plan(plan) if plan else dict(subs_core.TRIAL_CAPS)
+    except Exception:
+        log.exception("plan caps lookup failed for %s", uid)
+        return dict(subs_core.TRIAL_CAPS)
+    _caps_cache[uid] = (time.time(), caps)
+    return caps
+
+
+def _hidden_for(caps) -> set:
+    hidden = set()
+    if not caps["bot"]:
+        hidden |= BOT_BUTTON_TEXTS
+    if not caps["ai"]:
+        hidden |= AI_BUTTON_TEXTS
+    return hidden
+
+
+async def _gate_markup(uid, markup):
+    """Removes buttons the user's plan does not include. Admin and non-chat sends are untouched."""
+    if not isinstance(uid, int) or uid <= 0 or uid == ADMIN_ID or not isinstance(markup, InlineKeyboardMarkup):
+        return markup
+    hidden = _hidden_for(await plan_caps(uid))
+    if not hidden:
+        return markup
+    rows = [kept for kept in ([b for b in row if b.text not in hidden] for row in markup.inline_keyboard) if kept]
+    return InlineKeyboardMarkup(rows)
+
+
 class PremiumBot(ExtBot):
     """Applies admin-chosen premium emoji to outgoing text/captions and button icons.
     Any Telegram rejection falls back to the original, plain send so messages are never lost."""
@@ -2832,6 +2886,8 @@ class PremiumBot(ExtBot):
         return await self._premium_send(super().send_photo, dict(kwargs, photo=photo))
 
     async def _premium_send(self, method, kw):
+        if kw.get("reply_markup") is not None and "chat_id" in kw:
+            kw["reply_markup"] = await _gate_markup(kw["chat_id"], kw["reply_markup"])
         if not LOOK["premium_on"]:
             return await method(**kw)
         new = dict(kw)
@@ -3183,6 +3239,8 @@ async def groq_key_valid(api_key: str) -> bool:
 
 async def ai_reply_for(session_key: str, event):
     """Returns the AI reply text, or None to fall back to the normal auto-reply."""
+    if not (await plan_caps(tenant_id()))["ai"]:
+        return None
     enc = await db.get_setting("ai_groq_key", None)
     profile = ((await db.get_setting("ai_profile", "")) or "").strip()
     if not enc or not profile or not await db.get_setting("ai_policy_accepted_at", None):
@@ -3397,6 +3455,9 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await look_text_input(update, uid, current, text)
     if current in ("await_groq_key", "await_ai_profile"):
         return await ai_text_input(update, uid, current, text)
+    if text in BOT_BUTTON_TEXTS or text in AI_BUTTON_TEXTS:
+        if text in _hidden_for(await plan_caps(uid)):
+            return await update.message.reply_text(LOCKED_TEXT)
     if text in {"🤖 AI Mode", "🔑 Groq API Key", "📚 AI Profile", "✅ I Accept These Rules"}:
         return await ai_menu_action(update, uid, text)
     if text == "⬅️ Back":
@@ -4227,6 +4288,13 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "➕ Add Session":
+        caps = await plan_caps(uid)
+        if caps["max_accounts"] is not None:
+            existing = await session_store.get_sessions(enabled_only=False)
+            if len(existing) >= caps["max_accounts"]:
+                return await update.message.reply_text(
+                    f"🔒 Your plan allows {caps['max_accounts']} account(s). Remove one or ask the admin to upgrade.",
+                    reply_markup=ACCOUNTS_MENU)
         state[uid] = "choose_add_method"
         await update.message.reply_text(
             "How do you want to add the Telegram account?",
