@@ -4702,6 +4702,73 @@ async def account_status_text() -> str:
     return text
 
 
+def _decrypts(value) -> bool:
+    if not value:
+        return False
+    try:
+        fernet.decrypt(value.encode())
+        return True
+    except Exception:
+        return False
+
+
+async def find_undecryptable() -> list[tuple[int, str, object]]:
+    """Accounts and bot tokens that the current FERNET_KEY cannot open: (operator, kind, record)."""
+    found = []
+    for uid in sorted(APPROVED_USERS):
+        try:
+            for r in await tenant_sessions(uid).get_sessions(enabled_only=False):
+                if "session_enc" in r and not _decrypts(r.get("session_enc")):
+                    found.append((uid, "account", r))
+            for b in await tenant_db(uid).list_bot_accounts():
+                if "token_enc" in b and not _decrypts(b.get("token_enc")):
+                    found.append((uid, "bot", b))
+        except Exception:
+            log.warning("cleanup scan failed for operator %s", uid)
+    return found
+
+
+def _cleanup_preview_text(found) -> tuple[str, InlineKeyboardMarkup]:
+    if not found:
+        return ("✅ No old accounts found. Every stored account opens with the current key.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="adm:acc")]]))
+    lines = []
+    for uid, kind, rec in found[:30]:
+        if kind == "account":
+            lines.append(f"• account <code>{rec.get('id')}</code> {esc(rec.get('first_name') or rec.get('label') or '')} (operator <code>{uid}</code>)")
+        else:
+            lines.append(f"• bot <code>{rec.get('bot_id')}</code> @{esc(rec.get('username') or '-')} (operator <code>{uid}</code>)")
+    more = f"\n…and {len(found) - 30} more" if len(found) > 30 else ""
+    text = (f"🧹 <b>OLD ACCOUNTS THAT CANNOT BE OPENED</b>\n\n"
+            f"Found <b>{len(found)}</b>. These were saved with an old FERNET_KEY and will never work again.\n\n"
+            + "\n".join(lines) + more + "\n\n<b>This deletes them permanently.</b> Tap confirm only if you are sure.")
+    return text, InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete these permanently", callback_data="adm:cleanok")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="adm:acc")]])
+
+
+async def delete_undecryptable() -> tuple[int, int]:
+    found = await find_undecryptable()
+    accounts = bots = 0
+    for uid, kind, rec in found:
+        try:
+            if kind == "account":
+                sid = str(rec["id"])
+                await close_account_client(sid)
+                if await tenant_sessions(uid).delete_session(sid):
+                    accounts += 1
+            else:
+                bot_id = int(rec["bot_id"])
+                task = BOT_ACCOUNT_TASKS.pop((uid, bot_id), None)
+                if task:
+                    task.cancel()
+                if await tenant_db(uid).delete_bot_account(bot_id):
+                    bots += 1
+        except Exception:
+            log.exception("could not delete an old %s for operator %s", kind, uid)
+    return accounts, bots
+
+
 def admin_markup():
     m = "ON 🔴" if MAINTENANCE["on"] else "OFF 🟢"
     return InlineKeyboardMarkup([
@@ -4729,11 +4796,31 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (f"👥 <b>APPROVED USERS</b>\n\nAdmin: <code>{ADMIN_ID}</code>\n"
                 + ("\n".join(f"• <code>{u}</code>" for u in ops) if ops else "No other users.")
                 + "\n\nUse /add &lt;uid&gt; and /rem &lt;uid&gt; to change access.")
+    elif action == "cleanpre":
+        text, markup = _cleanup_preview_text(await find_undecryptable())
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                log.warning("cleanup preview failed: %s", exc)
+        return
+    elif action == "cleanok":
+        accounts, bots = await delete_undecryptable()
+        await tenant_db(ADMIN_ID).set_setting("cleanup_last", str(int(time.time())))
+        text = (f"✅ Deleted <b>{accounts}</b> old account(s) and <b>{bots}</b> old bot(s).\n"
+                "Ab naye accounts add karein ya chalu accounts ko check karein.")
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📡 Account Status", callback_data="adm:acc")]]))
+        except BadRequest:
+            pass
+        return
     elif action == "acc":
         text = await account_status_text()
         try:
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Refresh", callback_data="adm:acc")],
+                [InlineKeyboardButton("🧹 Clean old (undecryptable) accounts", callback_data="adm:cleanpre")],
                 [InlineKeyboardButton("⬅️ Back", callback_data="adm:home")]]))
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():
@@ -5016,7 +5103,7 @@ def main():
     app.add_handler(CommandHandler("start", authorized_handler(start)))
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
-    app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back|acc)$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back|acc|cleanpre|cleanok)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji|front|fbio)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+)|frt:[er]|fbio:(?:t|tg|run))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
