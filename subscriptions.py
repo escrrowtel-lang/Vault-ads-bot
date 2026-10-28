@@ -220,10 +220,11 @@ class Store:
 
     # ---- bot users (registered on /start) for broadcast
     def touch_user(self, uid, name):
-        self.users.update_one(
+        res = self.users.update_one(
             {"owner_id": self.owner_id, "user_id": int(uid)},
             {"$set": {"name": (name or "")[:64], "last_seen": now_utc(), "blocked": False},
              "$setOnInsert": {"first_seen": now_utc()}}, upsert=True)
+        return res.upserted_id is not None          # True only the first time this user is seen
 
     def recipients(self):
         return [d["user_id"] for d in self.users.find({"owner_id": self.owner_id, "blocked": {"$ne": True}},
@@ -503,6 +504,41 @@ async def shutdown():
         await asyncio.to_thread(STORE.close)
 
 
+# ----------------------------------------------------------------- log channel
+LOG_BOT: dict = {"bot": None}
+_LOG_CACHE = {"at": 0.0, "chat": None}
+
+
+def set_log_bot(bot) -> None:
+    LOG_BOT["bot"] = bot
+
+
+async def set_log_channel(value: str) -> None:
+    """Admin sets the channel ('' clears it). Cache is updated at once."""
+    await run(STORE.set_setting, "log_channel", value)
+    _LOG_CACHE.update(at=time.monotonic(), chat=value)
+
+
+async def log_event(text: str) -> bool:
+    """Posts a bot event to the admin's log channel. Never raises; returns False if not posted."""
+    try:
+        bot = LOG_BOT["bot"]
+        if not STORE or bot is None:
+            return False
+        if time.monotonic() - _LOG_CACHE["at"] > 60:          # at most one settings read a minute
+            _LOG_CACHE["chat"] = await run(STORE.get_setting, "log_channel")
+            _LOG_CACHE["at"] = time.monotonic()
+        chat = (_LOG_CACHE["chat"] or "").strip()
+        if not chat:
+            return False
+        chat_id = int(chat) if chat.lstrip("-").isdigit() else chat
+        await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        log.warning("log channel post failed: %s", type(e).__name__)
+        return False
+
+
 async def _notify(uid, text):
     try:
         if HOOKS.get("notify"):
@@ -564,6 +600,7 @@ async def create_checkout(user_id: int, plan_id: str):
             log.warning("payment link creation failed for user %s: %s", user_id, e)
             raise RuntimeError("Could not start the payment. Please try again in a moment.")
         await run(STORE.audit, f"user:{user_id}", "payment_created", ref, {"plan": plan["plan_id"], "amount_paise": doc["amount_paise"]})
+        await log_event(f"💳 Payment started · user <code>{user_id}</code> · {_h(plan['name'])} · {fmt_inr(doc['amount_paise'])}")
         return updated, False
 
 
@@ -631,6 +668,8 @@ async def activate(ref: str) -> bool:
         await run(STORE.release_fulfillment, ref, e)
         return False
     if applied:
+        await log_event(f"✅ Subscription activated · user <code>{uid}</code> · {_h(doc['plan_name'])} · "
+                        f"{fmt_inr(doc['amount_paise'])} · until {fmt_dt(sub['expires_at'])}")
         await _notify(uid, "✅ <b>Payment verified!</b>\n\n"
                            f"Plan: <b>{_h(doc['plan_name'])}</b>\nAmount: {fmt_inr(doc['amount_paise'])}\n"
                            f"Active until: <b>{fmt_dt(sub['expires_at'])}</b>\n\nSend /start to open the bot.")
@@ -774,6 +813,7 @@ async def expiry_sweep():
                     await HOOKS["revoke"](uid)
                 await run(STORE.mark_access_revoked, uid)
             await run(STORE.audit, "system", "subscription_expired", uid, {"revoked": bool(claimed.get("revoke_on_expiry", True))})
+            await log_event(f"⌛ Subscription expired · user <code>{uid}</code>")
             if notify:
                 await _notify(uid, "⌛ <b>Your subscription has expired.</b>\n\nTap /start → 💎 Purchase Subscription to renew.")
         except Exception:
@@ -854,6 +894,7 @@ async def start_trial(uid: int, name: str = "") -> tuple[bool, str]:
                                   manual=True)
         await HOOKS["grant"](uid)
         await run(STORE.audit, f"user:{uid}", "trial_started", ref, {"days": TRIAL_DAYS, "name": name[:40]})
+        await log_event(f"🎁 Free trial started · user <code>{uid}</code> · {_h(name[:40])}")
     return True, (f"🎁 <b>Free trial started!</b>\nFull access is active until <b>{fmt_dt(sub['expires_at'])}</b>.\n\n"
                   "Tap below to open the bot.")
 
@@ -866,6 +907,7 @@ async def admin_extend(uid: int, days: int, actor: int):
         sub, _ = await run(STORE.apply_subscription, uid, None, "Manual (admin)", days, ref, False, manual=True)
         await HOOKS["grant"](uid)
     await run(STORE.audit, f"admin:{actor}", "manual_extend", uid, {"days": days, "expires_at": sub["expires_at"].isoformat()})
+    await log_event(f"🛠 Admin extended · user <code>{uid}</code> · {days} day(s)")
     await _notify(uid, f"✅ Your subscription was extended by {days} day(s). Active until <b>{fmt_dt(sub['expires_at'])}</b>.")
     return sub
 
@@ -877,6 +919,7 @@ async def admin_revoke(uid: int, actor: int):
             return None
         await HOOKS["revoke"](uid)
     await run(STORE.audit, f"admin:{actor}", "manual_revoke", uid)
+    await log_event(f"🚫 Admin ended subscription · user <code>{uid}</code>")
     await _notify(uid, "🚫 Your subscription has been ended by the administrator.")
     return sub
 

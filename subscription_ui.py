@@ -258,7 +258,8 @@ async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("sadm", None)
     if S.STORE:
         try:
-            await S.run(S.STORE.touch_user, user.id, user.first_name)
+            if await S.run(S.STORE.touch_user, user.id, user.first_name):
+                await S.log_event(f"👋 New user · {h(user.first_name or '-')} · <code>{user.id}</code>")
         except Exception:
             log.warning("could not register bot user")
     if user.id in CFG["approved"] or user.id == CFG["admin_id"] or not _public_start_enabled():
@@ -319,6 +320,7 @@ async def dash_view(note=""):
     rows = [[B("💳 Payments", "sadm:pay:all:0"), B("⏳ Pending", "sadm:pay:pending:0")],
             [B("👥 Subscribers", "sadm:subs:all:0"), B("🔎 Find User", "sadm:find")],
             [B("📦 Plans", "sadm:plans"), B("⏰ Expiry Check", "sadm:exp")],
+            [B("📜 Log Channel", "sadm:logch")],
             [B("🙋 Approved Users", "sadm:users"), B("📣 Broadcast", "sadm:bc")],
             [B("👋 Welcome Msg", "sadm:wm"), B("🧾 Audit Log", "sadm:audit:0")],
             [B("🎁 Toggle free trial", "sadm:trial")],
@@ -494,6 +496,18 @@ def _prompt(ctx, act, text, back="sadm:home", **extra):
     return text, [[B("❌ Cancel", "sadm:cancel")]]
 
 
+async def logch_view(note=""):
+    cur = (await S.run(S.STORE.get_setting, "log_channel")) if S.STORE else ""
+    lines = ["📜 <b>LOG CHANNEL</b>", "",
+             "Bot events are posted here: new users, accounts added or removed, operators added or removed, "
+             "payments, subscriptions, trials and expiries.", "",
+             f"Channel: <b>{h(cur) if cur else 'not set'}</b>", "",
+             "Add this bot as an admin in the channel first (permission to post)."]
+    rows = [[B("✏️ Set channel", "sadm:logset")], [B("🧪 Send test", "sadm:logtest")],
+            [B("🗑 Remove channel", "sadm:logclr")], [B("⬅️ Back", "sadm:home")]]
+    return (note + "\n\n" if note else "") + "\n".join(lines), rows
+
+
 async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not _is_admin(q.from_user):
@@ -513,6 +527,18 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if a == "plans":
             ctx.user_data.pop("sadm", None)
             return await _edit(q, *await plans_view())
+        if a == "logch":
+            return await _edit(q, *await logch_view())
+        if a == "logset":
+            return await _edit(q, *_prompt(ctx, "logch", "📜 Send the log channel ID (like -1001234567890) "
+                                           "or the @channel username.", back="sadm:logch"))
+        if a == "logclr":
+            await S.set_log_channel("")
+            return await _edit(q, *await logch_view("🗑 Log channel removed."))
+        if a == "logtest":
+            ok = await S.log_event("🧪 Test message: the log channel is working.")
+            return await _edit(q, *await logch_view("✅ Test sent." if ok else
+                                                   "❌ Could not post. Check the channel ID and that the bot is an admin there."))
         if a == "pl":
             return await _edit(q, *await plan_view(parts[2]))
         if a == "pnew":
@@ -671,6 +697,16 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop("sadm", None)
             await S.run(S.STORE.audit, f"admin:{actor}", "plan_edit", st["pid"], {field: val})
             text, rows = await plan_view(st["pid"], "✅ Plan updated.")
+        elif act == "logch":
+            chat = txt.strip()
+            if not chat or len(chat) > 64 or " " in chat:
+                raise ValueError("Send a channel ID like -1001234567890 or @channelname.")
+            await S.set_log_channel(chat)
+            if not await S.log_event("✅ Log channel connected. Bot events will be posted here."):
+                await S.set_log_channel("")
+                raise ValueError("Could not post to that channel. Add this bot as an admin there and send the ID again.")
+            ctx.user_data.pop("sadm", None)
+            text, rows = await logch_view("✅ Log channel saved.")
         elif act == "find":
             if not txt.isdigit() or int(txt) <= 0:
                 raise ValueError("Send a numeric Telegram user ID.")

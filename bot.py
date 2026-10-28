@@ -1400,6 +1400,8 @@ async def _register_validated_session(client: TelegramClient, me, session_string
         stored_row = next((r for r in rows if str(r.get("id")) == str(stored_sid)), None)
         if stored_row is None:
             raise RuntimeError("Session was saved but could not be loaded from MongoDB")
+        await subs_core.log_event(f"➕ Account added · operator <code>{tenant_id()}</code> · "
+                                  f"{esc(label)} · tg <code>{me.id}</code>")
 
         # Still under the same account lock: background get_account_client() calls
         # for this account cannot create another client until adoption is complete.
@@ -2483,6 +2485,7 @@ async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_tenant_listener(context.application, uid)
         await start_join_queue_service(context.application, uid)
         await sync_bot_account_listeners(context.application, uid)
+        await subs_core.log_event(f"👤 Operator added · <code>{uid}</code> · by owner")
         await update.message.reply_text(f"✅ Added {uid}. Their sessions, bot accounts, posts, media and jobs are separate.\n\nThey can now open /start.")
         try:
             await context.bot.send_message(uid, "✅ The owner has granted you access. Open /start to begin.")
@@ -2502,6 +2505,7 @@ async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("The owner cannot be removed.")
     if uid not in APPROVED_USERS:
         return await update.message.reply_text("That user is not approved.")
+    await subs_core.log_event(f"🚫 Operator removed · <code>{uid}</code> · by owner")
     APPROVED_USERS.discard(uid)  # Reject new actions before stopping existing jobs.
     await asyncio.to_thread(operator_access.delete_one, {"_id": uid})
     st = tenant_stats(uid)
@@ -2581,6 +2585,7 @@ async def sub_start(app: Application):
             "revoke": lambda uid: sub_revoke_access(app, uid),
             "notify": _notify,
         })
+        subs_core.set_log_bot(app.bot)
         await subs_core.expiry_sweep()      # revoke anything that expired while the bot was offline
         await subs_core.start_background()
         log.info("Subscription service started (payments configured: %s, webhook secret: %s)",
@@ -4158,6 +4163,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_cache.clear()
             if not deleted:
                 raise ValueError("Session not found")
+            await subs_core.log_event(f"🗑 Account removed · operator <code>{tenant_id()}</code> · {esc(session_ref)}")
             await update.message.reply_text(f"✅ Session {session_ref} removed.", reply_markup=MENU)
         except Exception:
             await update.message.reply_text("❌ Send the Mongo session ID shown in Sessions, or its numeric Telegram user ID.", reply_markup=ACCOUNTS_MENU)
@@ -4802,6 +4808,7 @@ async def session_remove_confirm(update: Update, context: ContextTypes.DEFAULT_T
     stats.cached_group_count.pop(sid, None)
     stats.cached_user_count.pop(sid, None)
     if deleted:
+        await subs_core.log_event(f"🗑 Account removed · operator <code>{tenant_id()}</code> · {esc(label)}")
         await q.edit_message_text(
             f"✅ <b>SESSION REMOVED</b>\n\n👤 {esc(label)}",
             parse_mode=ParseMode.HTML,
