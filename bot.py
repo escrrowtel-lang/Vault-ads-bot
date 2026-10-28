@@ -32,6 +32,7 @@ from telegram.ext import (
 from telethon import TelegramClient, errors, types, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
@@ -2568,7 +2569,7 @@ async def _clear_legacy_keyboard(message, uid: int):
 async def show_main_menu(message, uid: int | None = None):
     uid = uid or (message.chat.id if getattr(message, "chat", None) else tenant_id())
     if getattr(message, "edit_in_place", False):
-        await message.reply_text(MAIN_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_markup(uid))
+        await message.reply_text(await main_text(), parse_mode=ParseMode.HTML, reply_markup=main_markup(uid))
         return
     chat_id = message.chat.id if getattr(message, "chat", None) else uid
     prev = LAST_MENU.pop(chat_id, None)
@@ -2578,7 +2579,7 @@ async def show_main_menu(message, uid: int | None = None):
         except Exception:
             pass
     await _clear_legacy_keyboard(message, uid)
-    sent = await message.reply_text(MAIN_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_markup(uid))
+    sent = await message.reply_text(await main_text(), parse_mode=ParseMode.HTML, reply_markup=main_markup(uid))
     LAST_MENU[chat_id] = sent.message_id
 
 
@@ -2800,6 +2801,9 @@ def _premium_markup(markup):
             eid = _icon_for(btn.callback_data, btn.text or "")
             if eid:
                 d = btn.to_dict()
+                em = NORMAL_EMOJI_FOR.get(btn.callback_data) or _leading_emoji(btn.text or "")
+                if em and (btn.text or "").startswith(em):
+                    d["text"] = (btn.text[len(em):].lstrip()) or btn.text
                 d["icon_custom_emoji_id"] = eid
                 new_row.append(InlineKeyboardButton.de_json(d, None))
             else:
@@ -2854,6 +2858,8 @@ def look_home_view():
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧭 Front Menu", callback_data="adm:menu")],
                 [InlineKeyboardButton("💠 Premium Emoji", callback_data="adm:emoji")],
+                [InlineKeyboardButton("📝 Front Message", callback_data="adm:front")],
+                [InlineKeyboardButton("🏷 Free-Plan Bio", callback_data="adm:fbio")],
                 [InlineKeyboardButton("⬅️ Back", callback_data="adm:home")],
             ]))
 
@@ -3007,6 +3013,33 @@ async def look_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 LOOK["premium_map"].pop(keys[n], None)
                 await save_look_settings()
                 text, markup = emoji_view("🗑 Removed.")
+    if data == "adm:front":
+        text, markup = await front_admin_view()
+    elif data == "frt:e":
+        state[uid] = "await_front_text"
+        text = "✏️ Send the new front message now. Telegram formatting (bold, italic, links) is kept. Max 3500 characters."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="adm:front")]])
+    elif data == "frt:r":
+        await tenant_db(ADMIN_ID).set_setting("front_text", "")
+        text, markup = await front_admin_view("↩️ Reset to the default message.")
+    elif data == "adm:fbio":
+        text, markup = await fbio_view()
+    elif data == "fbio:t":
+        state[uid] = "await_free_tag"
+        text = "🏷 Send the tag to put in the bio (for example @YourBotName), max 60 characters, one line."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="adm:fbio")]])
+    elif data == "fbio:tg":
+        adb = tenant_db(ADMIN_ID)
+        on = (await adb.get_setting("free_bio_enabled", "0")) == "1"
+        await adb.set_setting("free_bio_enabled", "0" if on else "1")
+        text, markup = await fbio_view("✅ Turned " + ("OFF" if on else "ON") + ".")
+    elif data == "fbio:run":
+        tag = ((await tenant_db(ADMIN_ID).get_setting("free_bio_tag", "")) or "").strip()
+        if not tag:
+            text, markup = await fbio_view("❌ Set a tag first.")
+        else:
+            c = await enforce_free_bio_tags(tag)
+            text, markup = await fbio_view(f"🔁 Checked {c['checked']} · fixed {c['fixed']} · failed {c['failed']}.")
     if text is None:
         return
     try:
@@ -3038,6 +3071,30 @@ async def look_text_input(update: Update, uid: int, current: str, text: str):
             LOOK["menu"].pop(k, None)
         await save_look_settings()
         t, m = menu_editor_view("✅ Label updated.")
+        return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+    if current == "await_front_text":
+        body = msg.text_html or ""
+        if not body or len(body) > 3500:
+            state[uid] = current
+            return await msg.reply_text("❌ Send a message of 1–3500 characters, or tap ❌ Cancel.")
+        try:
+            await msg.get_bot().send_message(chat_id=uid, text=body, parse_mode=ParseMode.HTML,
+                                             disable_web_page_preview=True)
+        except BadRequest as e:
+            state[uid] = current
+            return await msg.reply_text(f"❌ Telegram rejected the formatting ({e.message}). Edit and send again.")
+        await tenant_db(ADMIN_ID).set_setting("front_text", body)
+        t, m = await front_admin_view("✅ Front message saved.")
+        return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
+    if current == "await_free_tag":
+        tag = text.strip()
+        if not 1 <= len(tag) <= 60 or "\n" in tag:
+            state[uid] = current
+            return await msg.reply_text("❌ Tag must be 1–60 characters on one line. Send again or tap ❌ Cancel.")
+        adb = tenant_db(ADMIN_ID)
+        await adb.set_setting("free_bio_tag", tag)
+        await adb.set_setting("free_bio_enabled", "1")
+        t, m = await fbio_view("✅ Tag saved and turned ON.")
         return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
     if current.startswith("await_btn_emoji:"):
         ch = current.split(":", 1)[1]
@@ -3219,6 +3276,111 @@ async def ai_text_input(update: Update, uid: int, current: str, text: str):
                                 parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
 
 
+async def main_text() -> str:
+    try:
+        return (await tenant_db(ADMIN_ID).get_setting("front_text", "")) or MAIN_TEXT
+    except Exception:
+        return MAIN_TEXT
+
+
+# ---- Free-plan bio tag: accounts of free-plan users must keep the admin's tag in their bio.
+FREE_BIO_INTERVAL_SECONDS = 600
+BIO_LIMIT = 70
+
+
+def _fit_bio(bio: str, tag: str) -> str:
+    base = (bio or "").strip()
+    if tag.lower() in base.lower():
+        return base
+    if len(base) + 1 + len(tag) <= BIO_LIMIT:
+        return f"{base} {tag}".strip()
+    room = BIO_LIMIT - len(tag) - 1
+    return f"{base[:max(room, 0)].rstrip()} {tag}".strip()
+
+
+async def _is_free_plan(uid: int) -> bool:
+    if not subs_core.STORE:
+        return False
+    sub = await subs_core.run(subs_core.STORE.get_sub, uid)
+    return bool(sub and sub.get("status") == "active" and sub.get("plan_id") == "trial"
+                and subs_core._aware(sub["expires_at"]) > subs_core.now_utc())
+
+
+async def enforce_free_bio_tags(tag: str) -> dict:
+    counts = {"checked": 0, "fixed": 0, "failed": 0}
+    for uid in sorted(APPROVED_USERS - {ADMIN_ID}):
+        if not await _is_free_plan(uid):
+            continue
+        token = CURRENT_OPERATOR.set(uid)
+        try:
+            rows = await session_store.get_sessions(enabled_only=True)
+            for row in rows:
+                counts["checked"] += 1
+                try:
+                    client = await get_account_client(row)
+                    if not client.is_connected():
+                        raise RuntimeError("not connected")
+                    full = await client(GetFullUserRequest("me"))
+                    bio = full.full_user.about or ""
+                    new_bio = _fit_bio(bio, tag)
+                    if new_bio != bio.strip():
+                        await client(UpdateProfileRequest(about=new_bio))
+                        counts["fixed"] += 1
+                        await asyncio.sleep(2)
+                except errors.FloodWaitError as e:
+                    counts["failed"] += 1
+                    await asyncio.sleep(min(e.seconds, 60))
+                except Exception as e:
+                    counts["failed"] += 1
+                    log.warning("free bio check failed for %s: %s", row.get("id"), type(e).__name__)
+        finally:
+            CURRENT_OPERATOR.reset(token)
+    return counts
+
+
+async def free_bio_guard_loop():
+    while True:
+        try:
+            adb = tenant_db(ADMIN_ID)
+            tag = ((await adb.get_setting("free_bio_tag", "")) or "").strip()
+            if tag and (await adb.get_setting("free_bio_enabled", "0")) == "1":
+                await enforce_free_bio_tags(tag)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("free bio guard error")
+        await asyncio.sleep(FREE_BIO_INTERVAL_SECONDS)
+
+
+async def front_admin_view(note=""):
+    cur = await main_text()
+    custom = bool(await tenant_db(ADMIN_ID).get_setting("front_text", ""))
+    text = (note + "\n\n" if note else "") + (
+        "📝 <b>FRONT MESSAGE</b>\n\nThis text is shown above the front menu.\n"
+        f"<i>{'Custom message active.' if custom else 'Using the default message.'}</i>\n\n— Preview —\n") + cur
+    return text, InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Edit", callback_data="frt:e")],
+        [InlineKeyboardButton("↩️ Reset to default", callback_data="frt:r")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="adm:look")],
+    ])
+
+
+async def fbio_view(note=""):
+    adb = tenant_db(ADMIN_ID)
+    tag = ((await adb.get_setting("free_bio_tag", "")) or "").strip()
+    on = (await adb.get_setting("free_bio_enabled", "0")) == "1"
+    lines = ["🏷 <b>FREE-PLAN BIO TAG</b>", "",
+             "Accounts of users on the free trial keep this tag in their Telegram bio.",
+             "If they remove it, the bot adds it back automatically.", "",
+             f"Tag: <b>{esc(tag) if tag else 'not set'}</b>",
+             f"Status: <b>{'ON 🟢' if on else 'OFF 🔴'}</b>"]
+    rows = [[InlineKeyboardButton("✏️ Set tag", callback_data="fbio:t")],
+            [InlineKeyboardButton("🔁 Turn " + ("OFF" if on else "ON"), callback_data="fbio:tg")],
+            [InlineKeyboardButton("▶️ Check now", callback_data="fbio:run")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="adm:look")]]
+    return (note + "\n\n" if note else "") + "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update) or not update.message:
         return
@@ -3230,6 +3392,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Auto-reply submenu: always process Back before text input.
     current = state.get(uid)
     if isinstance(current, str) and (current.startswith(("await_menu_label:", "await_btn_emoji:")) or current == "await_premium_emoji"):
+        return await look_text_input(update, uid, current, text)
+    if current in ("await_front_text", "await_free_tag"):
         return await look_text_input(update, uid, current, text)
     if current in ("await_groq_key", "await_ai_profile"):
         return await ai_text_input(update, uid, current, text)
@@ -4521,6 +4685,7 @@ async def session_remove_cancel(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def post_init(app: Application):
     await load_look_settings()
+    asyncio.create_task(free_bio_guard_loop(), name="free_bio_guard")
     # Hide Telegram's bottom-left 'Menu' button: no bot command list is registered,
     # so the commands-type menu button has nothing to show.
     try:
@@ -4631,7 +4796,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back)$"))
-    app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+))$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji|front|fbio)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+)|frt:[er]|fbio:(?:t|tg|run))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
