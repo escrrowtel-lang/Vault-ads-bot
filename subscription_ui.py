@@ -6,6 +6,7 @@ Callback prefixes used: `sub:` (users) and `sadm:` (admin only). Existing prefix
 import asyncio
 import html
 import logging
+import re
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -91,7 +92,30 @@ async def welcome_view(uid=None):
         except Exception:
             log.warning("could not check trial eligibility")
     rows.append([B("💎 Purchase Subscription", "sub:home")])
+    if S.STORE and await S.run(S.STORE.get_setting, "support_text"):
+        rows.append([InlineKeyboardButton("🆘 Support", callback_data="sub:support")])
     return (cur or DEFAULT_WELCOME), rows
+
+
+async def support_view():
+    text = (await S.run(S.STORE.get_setting, "support_text")) if S.STORE else ""
+    user = (await S.run(S.STORE.get_setting, "support_username")) if S.STORE else ""
+    rows = []
+    if user:
+        rows.append([InlineKeyboardButton("💬 Contact support", url=f"https://t.me/{user}")])
+    rows.append([B("⬅️ Back", "sub:back")])
+    return (text or "🆘 <b>Support</b>\n\nContact the bot owner for help."), rows
+
+
+async def support_admin_view(note=""):
+    text = (await S.run(S.STORE.get_setting, "support_text")) or ""
+    user = (await S.run(S.STORE.get_setting, "support_username")) or ""
+    body = ("🆘 <b>SUPPORT</b>\n\nShown to users from the welcome screen.\n\n"
+            f"Text: <b>{'set' if text else 'not set'}</b>\n"
+            f"Username: <b>{h('@' + user) if user else 'not set'}</b>")
+    lines = (note + "\n\n" if note else "") + body
+    return lines, [[B("✏️ Set text", "sadm:supt")], [B("👤 Set username", "sadm:supu")],
+                   [B("🗑 Clear support", "sadm:supclr")], [B("⬅️ Back", "sadm:home")]]
 
 
 async def home_view(uid: int):
@@ -177,6 +201,9 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "home":
             await q.answer()
             return await _edit(q, *await home_view(user.id))
+        if action == "support":
+            await q.answer()
+            return await _edit(q, *await support_view())
         if action == "my":
             await q.answer()
             return await _edit(q, *await my_view(user.id))
@@ -262,8 +289,11 @@ async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
                 await S.log_event(f"👋 New user · {h(user.first_name or '-')} · <code>{user.id}</code>")
         except Exception:
             log.warning("could not register bot user")
-    if user.id in CFG["approved"] or user.id == CFG["admin_id"] or not _public_start_enabled():
+    if user.id in CFG["approved"] or user.id == CFG["admin_id"]:
         return
+    if not _public_start_enabled():
+        await update.message.reply_text("⛔ Access is by invitation only. Contact the bot owner.")
+        raise ApplicationHandlerStop
     text, rows = await welcome_view(user.id)
     markup = InlineKeyboardMarkup(rows)
     try:
@@ -320,7 +350,7 @@ async def dash_view(note=""):
     rows = [[B("💳 Payments", "sadm:pay:all:0"), B("⏳ Pending", "sadm:pay:pending:0")],
             [B("👥 Subscribers", "sadm:subs:all:0"), B("🔎 Find User", "sadm:find")],
             [B("📦 Plans", "sadm:plans"), B("⏰ Expiry Check", "sadm:exp")],
-            [B("📜 Log Channel", "sadm:logch")],
+            [B("📜 Log Channel", "sadm:logch"), B("🆘 Support", "sadm:sup")],
             [B("🙋 Approved Users", "sadm:users"), B("📣 Broadcast", "sadm:bc")],
             [B("👋 Welcome Msg", "sadm:wm"), B("🧾 Audit Log", "sadm:audit:0")],
             [B("🎁 Toggle free trial", "sadm:trial")],
@@ -527,6 +557,18 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if a == "plans":
             ctx.user_data.pop("sadm", None)
             return await _edit(q, *await plans_view())
+        if a == "sup":
+            return await _edit(q, *await support_admin_view())
+        if a == "supt":
+            return await _edit(q, *_prompt(ctx, "sup_text", "✏️ Send the support text. HTML formatting is kept "
+                                           "(bold, links). Max 1500 characters.", back="sadm:sup"))
+        if a == "supu":
+            return await _edit(q, *_prompt(ctx, "sup_user", "👤 Send the support username, for example "
+                                           "@YourSupport. Send 'none' to remove it.", back="sadm:sup"))
+        if a == "supclr":
+            await S.run(S.STORE.set_setting, "support_text", "")
+            await S.run(S.STORE.set_setting, "support_username", "")
+            return await _edit(q, *await support_admin_view("🗑 Support cleared."))
         if a == "logch":
             return await _edit(q, *await logch_view())
         if a == "logset":
@@ -707,6 +749,26 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("Could not post to that channel. Add this bot as an admin there and send the ID again.")
             ctx.user_data.pop("sadm", None)
             text, rows = await logch_view("✅ Log channel saved.")
+        elif act == "sup_text":
+            body = msg.text_html or ""
+            if not body or len(body) > 1500:
+                raise ValueError("Send 1–1500 characters.")
+            try:
+                await ctx.bot.send_message(chat_id=user.id, text=body, parse_mode=ParseMode.HTML)
+            except BadRequest as e:
+                raise ValueError(f"Telegram rejected the formatting ({e.message}). Edit and send again.")
+            await S.run(S.STORE.set_setting, "support_text", body)
+            ctx.user_data.pop("sadm", None)
+            text, rows = await support_admin_view("✅ Support text saved.")
+        elif act == "sup_user":
+            name = txt.strip().lstrip("@")
+            if name.lower() == "none":
+                name = ""
+            elif not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", name):
+                raise ValueError("Send a valid Telegram username like @YourSupport, or 'none'.")
+            await S.run(S.STORE.set_setting, "support_username", name)
+            ctx.user_data.pop("sadm", None)
+            text, rows = await support_admin_view("✅ Support username saved.")
         elif act == "find":
             if not txt.isdigit() or int(txt) <= 0:
                 raise ValueError("Send a numeric Telegram user ID.")

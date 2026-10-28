@@ -1156,9 +1156,7 @@ def authorized_handler(handler):
             # Sessions and account controls must not be exposed to group chats.
             return
         if uid not in APPROVED_USERS:
-            if handler is start and update.message:
-                await update.message.reply_text("⛔ Access denied. Contact the bot owner.")
-            return
+            return          # /start for non-approved users is answered by the subscription gate only
         if MAINTENANCE["on"] and uid != ADMIN_ID:
             if update.callback_query:
                 await update.callback_query.answer("🛠 Bot is under maintenance.", show_alert=True)
