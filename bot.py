@@ -2744,6 +2744,7 @@ HELP_ADMIN_SECTION = (
 HELP_TITLE = ("❓ <b>How to use this bot</b>\n"
               "<blockquote>Step-by-step guide. Tap a section to open it.</blockquote>")
 HELP_BANNER = Path(__file__).resolve().parent / "assets" / "help_banner.png"
+HELP_STEPS = Path(__file__).resolve().parent / "assets" / "getting_started.png"
 
 
 def help_messages(uid=None, title=True) -> list:
@@ -2762,9 +2763,9 @@ def help_messages(uid=None, title=True) -> list:
     return out
 
 
-def _help_banner_bytes():
+def _asset_bytes(path):
     try:
-        return HELP_BANNER.read_bytes()
+        return path.read_bytes()
     except OSError:
         return None
 
@@ -2773,11 +2774,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user or update.effective_chat.type != "private":
         return
     chunks = help_messages(update.effective_user.id, title=False)
-    photo = _help_banner_bytes()
-    if photo:
-        await update.message.reply_photo(photo=photo, caption=HELP_TITLE, parse_mode=ParseMode.HTML)
+    banner, steps = _asset_bytes(HELP_BANNER), _asset_bytes(HELP_STEPS)
+    if banner:
+        await update.message.reply_photo(photo=banner, caption=HELP_TITLE, parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(HELP_TITLE, parse_mode=ParseMode.HTML)
+    if steps:
+        await update.message.reply_photo(photo=steps, caption="Getting started in 4 steps")
     for chunk in chunks:
         await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
@@ -2787,11 +2790,13 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     chat_id = q.message.chat.id
     chunks = help_messages(q.from_user.id, title=False)
-    photo = _help_banner_bytes()
-    if photo:
-        await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=HELP_TITLE, parse_mode=ParseMode.HTML)
+    banner, steps = _asset_bytes(HELP_BANNER), _asset_bytes(HELP_STEPS)
+    if banner:
+        await context.bot.send_photo(chat_id=chat_id, photo=banner, caption=HELP_TITLE, parse_mode=ParseMode.HTML)
     else:
         await context.bot.send_message(chat_id=chat_id, text=HELP_TITLE, parse_mode=ParseMode.HTML)
+    if steps:
+        await context.bot.send_photo(chat_id=chat_id, photo=steps, caption="Getting started in 4 steps")
     for chunk in chunks:
         await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
 
