@@ -11,7 +11,7 @@ import httpx
 from functools import wraps
 from dataclasses import dataclass, field
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -188,6 +188,7 @@ PROMOTION_MENU = _inline_from_rows(
         ["⏱ Interval", "⏳ Group Delay"],
         ["🔄 Rescan Targets", "📨 DM Broadcast"],
         ["📅 Schedule"],
+        ["🌙 Quiet Hours"],
         ["🎯 Promo Accounts"],
         ["⬅️ Back"],
     ],
@@ -1829,6 +1830,8 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
         for target_index, (target_type, entity, name) in enumerate(targets):
             if not stats.running:
                 return
+            if quiet_remaining_seconds(await quiet_window()):
+                return                      # quiet hours started; the scheduler resumes later
             stats.current_session = row["label"]
             stats.current_group = f"{'👥' if target_type == 'group' else '👤'} {name}"
             target_key = (sid, str(entity))
@@ -2278,10 +2281,61 @@ async def dm_broadcast_runner(app: Application):
         set_broadcast_running(app, False)
 
 
+# ---- Quiet hours: a daily window (per operator) when promotions pause. Set from the Promotion menu.
+QUIET_CACHE: dict[int, tuple[float, tuple | None]] = {}
+DISPLAY_TZ_OFFSET = int(os.getenv("DISPLAY_TZ_OFFSET_MINUTES", "330"))
+
+
+def parse_quiet_window(raw: str) -> tuple[int, int]:
+    """'HH:MM-HH:MM' -> (start_minute, end_minute). Windows may cross midnight."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", raw or "")
+    if not m:
+        raise ValueError("format")
+    a = int(m[1]) * 60 + int(m[2])
+    b = int(m[3]) * 60 + int(m[4])
+    if a >= 1440 or b >= 1440 or a == b or int(m[2]) > 59 or int(m[4]) > 59:
+        raise ValueError("range")
+    return a, b
+
+
+async def quiet_window():
+    uid = tenant_id()
+    hit = QUIET_CACHE.get(uid)
+    if hit and time.monotonic() - hit[0] < 60:
+        return hit[1]
+    raw = (await db.get_setting("quiet_hours", "")) or ""
+    try:
+        win = parse_quiet_window(raw) if raw else None
+    except ValueError:
+        win = None
+    QUIET_CACHE[uid] = (time.monotonic(), win)
+    return win
+
+
+def quiet_remaining_seconds(win) -> float:
+    """Seconds until the quiet window ends, or 0 when promotions may run now."""
+    if not win:
+        return 0.0
+    now = datetime.now(timezone(timedelta(minutes=DISPLAY_TZ_OFFSET)))
+    mins = now.hour * 60 + now.minute
+    a, b = win
+    inside = (a <= mins < b) if a < b else (mins >= a or mins < b)
+    if not inside:
+        return 0.0
+    return ((b - mins) % 1440) * 60 - now.second
+
+
 async def scheduler(app: Application):
     stats.running = True
     try:
         while stats.running:
+            wait = quiet_remaining_seconds(await quiet_window())
+            if wait:
+                stats.current_group = "🌙 Quiet hours"
+                stats.next_round_at = time.time() + wait
+                while stats.running and time.time() < stats.next_round_at:
+                    await asyncio.sleep(min(30, max(0.2, stats.next_round_at - time.time())))
+                continue
             try:
                 await do_round(app)
             except asyncio.CancelledError:
@@ -2699,6 +2753,7 @@ HELP_SECTIONS = [
      "🔄 Rescan Targets: refresh the group list.\n"
      "📨 DM Broadcast: message your contacts.\n"
      "📅 Schedule: set timed runs.\n"
+     "🌙 Quiet Hours: pause promotions in a daily window, e.g. 23:00-07:00.\n"
      "🎯 Promo Accounts: choose which accounts send ads."),
     ("📝 Posts",
      "📝 Save Post: store a post to send.\n"
@@ -4343,6 +4398,24 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Send a whole number of minutes (minimum {MIN_AD_INTERVAL_MINUTES}).", reply_markup=MENU)
         return
 
+    if current == "await_quiet":
+        state.pop(uid, None)
+        value = text.strip()
+        if value.lower() in ("off", "0", "none"):
+            await db.set_setting("quiet_hours", "")
+            QUIET_CACHE.pop(tenant_id(), None)
+            return await update.message.reply_text("✅ Quiet hours turned off.", reply_markup=MENU)
+        try:
+            parse_quiet_window(value)
+        except ValueError:
+            return await update.message.reply_text(
+                "❌ Use HH:MM-HH:MM, for example 23:00-07:00.", reply_markup=MENU)
+        await db.set_setting("quiet_hours", value)
+        QUIET_CACHE.pop(tenant_id(), None)
+        await update.message.reply_text(
+            f"✅ Quiet hours set to {value} (IST). No promotions run in this window.", reply_markup=MENU)
+        return
+
     if current == "await_remove":
         state.pop(uid, None)
         try:
@@ -4623,6 +4696,14 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=MENU,
         )
 
+    elif text == "🌙 Quiet Hours":
+        current = (await db.get_setting("quiet_hours", "")) or "off"
+        state[uid] = "await_quiet"
+        await update.message.reply_text(
+            f"Current quiet hours: {current} (IST).\n\nSend a daily window like 23:00-07:00. "
+            "Promotions pause during it. Send off to disable.",
+            reply_markup=MENU,
+        )
     elif text == "⏱ Interval":
         current_interval = await get_ad_interval_minutes()
         state[uid] = "await_interval"
