@@ -7,6 +7,7 @@ import time
 import random
 import re
 import contextvars
+import httpx
 from functools import wraps
 from dataclasses import dataclass, field
 from collections import deque
@@ -244,10 +245,13 @@ AUTO_REPLY_MENU = _inline_from_rows(
         ["✏️ Account Reply", "✏️ Control Bot Reply"],
         ["👁 Reply Preview", "🔄 Use Saved Post"],
         ["🟢 Toggle Account Reply", "🟢 Toggle Bot Reply"],
+        ["🤖 AI Mode", "🔑 Groq API Key"],
+        ["📚 AI Profile"],
         ["⏱ Reply Cooldown", "📡 Reply Status"],
         ["⬅️ Back"],
     ],
 )
+AI_POLICY_MENU = _inline_from_rows([["✅ I Accept These Rules"], ["⬅️ Back"]])
 
 ADD_SESSION_MENU = _inline_from_rows(
     [
@@ -2276,6 +2280,17 @@ def account_reply_handler(session_key: str):
             return
         _account_reply_pending.add(key)
         try:
+            if await reply_enabled("ai_reply_enabled", False):
+                ai_text = await ai_reply_for(session_key, event)
+                if ai_text:
+                    await pacer.run(
+                        session_key, DM_REPLY_SEND_GAP_SECONDS,
+                        lambda: guarded_account_send(session_key, lambda: event.reply(ai_text, link_preview=False)),
+                        priority=True,
+                    )
+                    _account_reply_timestamps[key] = time.monotonic()
+                    _reply_sent_counts["accounts"] += 1
+                    return
             if await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
                 mode = await db.get_setting("post_mode", "rotate")
                 post = await db.next_reply_post(mode)
@@ -2954,6 +2969,159 @@ async def look_text_input(update: Update, uid: int, current: str, text: str):
     return await msg.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=m)
 
 
+# ---- AI reply mode (Groq). Each owner brings their own Groq key; it is stored encrypted.
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+AI_POLICY_TEXT = (
+    "⚠️ <b>AI MODE — RULES</b>\n\n"
+    "AI jawab aapke account se bhejega. Aage badhne se pehle ye rules maanna zaroori hai:\n\n"
+    "🚫 WhatsApp ya Telegram accounts/numbers ko bechna, kharidna ya transfer karna sakht mana hai.\n"
+    "🚫 OTP, password, login code ya verification code maangna ya share karna mana hai.\n"
+    "🚫 Scam, fraud, impersonation ya spam ke liye use karna mana hai.\n"
+    "🚫 Paise ka lena-dena AI nahi karega.\n\n"
+    "Niyam todne par AI mode band ho jayega aur access hata diya jayega. "
+    "Groq key aur jawabon ki zimmedari aapki hogi."
+)
+AI_BLOCKED_REPLY = ("Is baat ke liye owner se direct baat karein. "
+                    "Main AI assistant hoon aur account, OTP ya payment se related kaam nahi karta.")
+AI_MEDIA_REPLY = "Abhi main sirf text samajh sakta hoon. Apna sawal likh kar bhejein."
+AI_RISKY = re.compile(
+    r"otp|password|2fa|login code|verification code|sell.{0,20}account|buy.{0,20}account|"
+    r"account.{0,20}(sale|sell|buy|transfer)|number.{0,20}(sale|sell|buy)|send money|upi|bitcoin|crypto|"
+    r"(buy|sell|kharid|bech).{0,20}(account|number)|bech.{0,15}(account|number)|account.{0,15}bech", re.I)
+_ai_history: dict = {}
+
+
+def ai_is_risky(text: str) -> bool:
+    return bool(AI_RISKY.search(text or ""))
+
+
+def ai_system_prompt(profile: str) -> str:
+    return (
+        "You are an AI assistant replying on behalf of the account owner in a private chat. "
+        "Say you are an AI assistant in your first reply. Reply in 1-2 short sentences (max 200 characters), "
+        "in the same language the user uses (Hindi, English or Hinglish). "
+        "Use only the business information below. If you do not know, say the owner will reply soon. "
+        "Never ask for or share OTP, passwords, login or verification codes, or payment details. "
+        "Never help buy, sell or transfer WhatsApp or Telegram accounts or numbers. "
+        "Never help with scams, fraud, impersonation or spam.\n\nBUSINESS INFORMATION:\n" + profile
+    )
+
+
+async def groq_chat(api_key: str, system: str, messages: list) -> str:
+    payload = {"model": GROQ_MODEL, "messages": [{"role": "system", "content": system}] + messages,
+               "max_tokens": 120, "temperature": 0.4}
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(GROQ_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+async def groq_key_valid(api_key: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(GROQ_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"})
+        return r.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+async def ai_reply_for(session_key: str, event):
+    """Returns the AI reply text, or None to fall back to the normal auto-reply."""
+    enc = await db.get_setting("ai_groq_key", None)
+    profile = ((await db.get_setting("ai_profile", "")) or "").strip()
+    if not enc or not profile or not await db.get_setting("ai_policy_accepted_at", None):
+        return None
+    incoming = (getattr(event, "raw_text", "") or "").strip()
+    if not incoming:
+        return AI_MEDIA_REPLY
+    if ai_is_risky(incoming):
+        return AI_BLOCKED_REPLY
+    try:
+        api_key = fernet.decrypt(enc.encode()).decode()
+    except InvalidToken:
+        log.warning("Stored Groq key cannot be decrypted; AI reply skipped")
+        return None
+    hist = _ai_history.setdefault((session_key, int(event.sender_id)), deque(maxlen=6))
+    hist.append({"role": "user", "content": incoming[:800]})
+    try:
+        reply = (await groq_chat(api_key, ai_system_prompt(profile), list(hist))).strip()[:500]
+    except Exception as e:
+        hist.pop()
+        log.warning("Groq reply failed: %s", type(e).__name__)
+        return None
+    if not reply:
+        hist.pop()
+        return None
+    hist.append({"role": "assistant", "content": reply})
+    return reply
+
+
+async def ai_status_text() -> str:
+    accepted = bool(await db.get_setting("ai_policy_accepted_at", None))
+    has_key = bool(await db.get_setting("ai_groq_key", None))
+    has_profile = bool(((await db.get_setting("ai_profile", "")) or "").strip())
+    on = await reply_enabled("ai_reply_enabled", False)
+    yes = lambda b: "✅" if b else "❌"
+    return ("🤖 <b>AI MODE</b>\n\n"
+            f"Status: <b>{'ON 🟢' if on else 'OFF 🔴'}</b>\n"
+            f"Rules accepted {yes(accepted)} · Groq key {yes(has_key)} · AI profile {yes(has_profile)}")
+
+
+async def ai_menu_action(update: Update, uid: int, text: str):
+    msg = update.message
+    if text == "✅ I Accept These Rules":
+        await db.set_setting("ai_policy_accepted_at", datetime.now(timezone.utc).isoformat())
+        return await msg.reply_text("✅ Rules accepted.\n\n" + await ai_status_text(),
+                                    parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+    if text == "🤖 AI Mode":
+        if not await db.get_setting("ai_policy_accepted_at", None):
+            return await msg.reply_text(AI_POLICY_TEXT, parse_mode=ParseMode.HTML, reply_markup=AI_POLICY_MENU)
+        if not await db.get_setting("ai_groq_key", None):
+            return await msg.reply_text("❌ Pehle 🔑 Groq API Key set karein.", reply_markup=AUTO_REPLY_MENU)
+        if not ((await db.get_setting("ai_profile", "")) or "").strip():
+            return await msg.reply_text("❌ Pehle 📚 AI Profile set karein.", reply_markup=AUTO_REPLY_MENU)
+        now_on = await reply_enabled("ai_reply_enabled", False)
+        await db.set_setting("ai_reply_enabled", "false" if now_on else "true")
+        return await msg.reply_text(await ai_status_text(), parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+    if text == "🔑 Groq API Key":
+        state[uid] = "await_groq_key"
+        return await msg.reply_text("🔑 Apni Groq API key bhejein (gsk_...). Message turant delete ho jayega. "
+                                    "Cancel ke liye Back dabayein.", reply_markup=AUTO_REPLY_MENU)
+    if text == "📚 AI Profile":
+        state[uid] = "await_ai_profile"
+        return await msg.reply_text(
+            "📚 Apna business likhein (20–2000 characters): aap kya bechte/sikhate hain, prices, timings, "
+            "FAQ. AI sirf isi ke andar jawab dega.", reply_markup=AUTO_REPLY_MENU)
+
+
+async def ai_text_input(update: Update, uid: int, current: str, text: str):
+    msg = update.message
+    state.pop(uid, None)
+    if text in {"⬅️ Back", "❌ Cancel"}:
+        return await msg.reply_text("Cancelled.", reply_markup=AUTO_REPLY_MENU)
+    if current == "await_groq_key":
+        key = text.strip()
+        await safe_delete_message(msg)
+        if not key.startswith("gsk_") or len(key) < 20:
+            state[uid] = current
+            return await msg.reply_text("❌ Ye Groq key jaisi nahi lagti. Dobara bhejein ya Back dabayein.")
+        if not await groq_key_valid(key):
+            state[uid] = current
+            return await msg.reply_text("❌ Groq ne ye key accept nahi ki. Dobara bhejein ya Back dabayein.")
+        await db.set_setting("ai_groq_key", fernet.encrypt(key.encode()).decode())
+        return await msg.reply_text("✅ Groq key saved (encrypted).\n\n" + await ai_status_text(),
+                                    parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+    profile = text.strip()
+    if not 20 <= len(profile) <= 2000:
+        state[uid] = current
+        return await msg.reply_text("❌ 20 se 2000 characters ke beech bhejein.")
+    await db.set_setting("ai_profile", profile)
+    return await msg.reply_text("✅ AI profile saved.\n\n" + await ai_status_text(),
+                                parse_mode=ParseMode.HTML, reply_markup=AUTO_REPLY_MENU)
+
+
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update) or not update.message:
         return
@@ -2966,6 +3134,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = state.get(uid)
     if isinstance(current, str) and (current.startswith("await_menu_label:") or current == "await_premium_emoji"):
         return await look_text_input(update, uid, current, text)
+    if current in ("await_groq_key", "await_ai_profile"):
+        return await ai_text_input(update, uid, current, text)
+    if text in {"🤖 AI Mode", "🔑 Groq API Key", "📚 AI Profile", "✅ I Accept These Rules"}:
+        return await ai_menu_action(update, uid, text)
     if text == "⬅️ Back":
         state.pop(uid, None)
         context.user_data.pop("bio_kind", None)
