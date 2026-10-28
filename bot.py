@@ -2956,6 +2956,19 @@ async def _gate_markup(uid, markup):
     return InlineKeyboardMarkup(rows)
 
 
+async def _with_network_retry(call, attempts: int = 4):
+    """Retries a Telegram call on network errors (not on BadRequest). Waits 1s, 2s, 4s between tries."""
+    delay = 1.0
+    for attempt in range(attempts):
+        try:
+            return await call()
+        except NetworkError:
+            if attempt == attempts - 1:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
 class PremiumBot(ExtBot):
     """Applies admin-chosen premium emoji to outgoing text/captions and button icons.
     Any Telegram rejection falls back to the original, plain send so messages are never lost."""
@@ -2979,7 +2992,7 @@ class PremiumBot(ExtBot):
         if kw.get("reply_markup") is not None and "chat_id" in kw:
             kw["reply_markup"] = await _gate_markup(kw["chat_id"], kw["reply_markup"])
         if not LOOK["premium_on"]:
-            return await method(**kw)
+            return await _with_network_retry(lambda: method(**kw))
         new = dict(kw)
         key = "text" if "text" in kw else ("caption" if "caption" in kw else None)
         if key and LOOK["premium_map"] and isinstance(kw[key], str) and kw.get("entities") is None and kw.get("caption_entities") is None:
@@ -2989,10 +3002,10 @@ class PremiumBot(ExtBot):
         if kw.get("reply_markup") is not None:
             new["reply_markup"] = _premium_markup(kw["reply_markup"])
         try:
-            return await method(**new)
+            return await _with_network_retry(lambda: method(**new))
         except BadRequest as e:
             log.warning("premium emoji send rejected (%s); sending plain", e)
-            return await method(**kw)
+            return await _with_network_retry(lambda: method(**kw))
 
 
 def _utf16_slice(text, offset, length):
