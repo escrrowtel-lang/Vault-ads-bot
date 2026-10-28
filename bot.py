@@ -92,6 +92,8 @@ def configure_logging():
     # Telethon logs automatic flood-wait sleeps at INFO. Keep warnings/errors,
     # while the cache below prevents repeated GetDialogsRequest calls.
     logging.getLogger("telethon.client.users").setLevel(logging.WARNING)
+    # "Got difference for channel ... updates" fires on every incoming update; it is not an error.
+    logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
 
     formatter = SecretRedactingFormatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
