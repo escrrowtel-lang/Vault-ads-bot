@@ -4630,10 +4630,73 @@ async def load_admin_settings():
         log.warning("Could not load admin settings: %s", e)
 
 
+async def account_status_text() -> str:
+    """Every operator's accounts: attached, connected, promotion running, flood state, last error."""
+    totals = {"accounts": 0, "enabled": 0, "connected": 0, "running": 0, "relogin": 0}
+    sections = []
+    for uid in sorted(APPROVED_USERS):
+        try:
+            rows = await tenant_sessions(uid).get_sessions(enabled_only=False)
+        except Exception:
+            log.warning("account status: could not read sessions for %s", uid)
+            sections.append(f"⚠️ Operator <code>{uid}</code>: could not read accounts")
+            continue
+        if not rows:
+            continue
+        st = tenant_stats(uid)
+        head = (f"👤 <b>Operator</b> <code>{uid}</code> · {len(rows)} account(s) · "
+                f"promo {'🟢 running' if st.running else '🔴 stopped'} · "
+                f"⏳ flood {st.flood_waits} · paused {st.paused_sessions}")
+        lines = [head]
+        for r in rows:
+            sid = str(r["id"])
+            enabled = bool(r.get("enabled", True))
+            relogin = r.get("auth_state", "active") == "needs_relogin"
+            client = _account_dm_clients.get(_client_key_from_row(r))
+            connected = bool(client and client.is_connected())
+            totals["accounts"] += 1
+            totals["enabled"] += enabled
+            totals["connected"] += connected
+            totals["relogin"] += relogin
+            name = esc(r.get("first_name") or r.get("label") or sid)
+            uname = f"@{esc(r['username'])}" if r.get("username") else "-"
+            if not enabled:
+                badge = "⚪ disabled"
+            elif relogin:
+                badge = "🔐 needs relogin"
+            elif connected:
+                badge = "🟢 connected"
+            else:
+                badge = "🔴 offline"
+            promo = ACCOUNT_METRICS.get((uid, sid, "promo"))
+            if promo and st.running:
+                totals["running"] += 1
+                work = f"▶️ promo {promo['attempted']}/{promo['total']} · ✅ {promo['sent']} · ❌ {promo['failed']}"
+            elif promo:
+                work = f"⏹ promo idle · ✅ {promo['sent']} sent total this run"
+            else:
+                work = "⏸ no promo this run"
+            line = f"• {name} {uname} · {badge}\n   {work}"
+            if promo and promo.get("last_error") not in (None, "", "-"):
+                line += f"\n   ⚠️ {esc(promo['last_error'])[:80]}"
+            lines.append(line)
+        sections.append("\n".join(lines))
+    summary = (f"📡 <b>ACCOUNT STATUS</b>\n\n"
+               f"Operators: <b>{len(APPROVED_USERS)}</b> · Accounts: <b>{totals['accounts']}</b>\n"
+               f"Enabled: <b>{totals['enabled']}</b> · 🟢 Connected: <b>{totals['connected']}</b> · "
+               f"▶️ Promo running: <b>{totals['running']}</b> · 🔐 Relogin: <b>{totals['relogin']}</b>\n\n")
+    body = "\n\n".join(sections) if sections else "No accounts attached yet."
+    text = summary + body
+    if len(text) > 3900:
+        text = text[:3850].rsplit("\n", 1)[0] + "\n\n…more accounts not shown. Check each operator in the Sessions menu."
+    return text
+
+
 def admin_markup():
     m = "ON 🔴" if MAINTENANCE["on"] else "OFF 🟢"
     return InlineKeyboardMarkup([
         [styled_button(f"🛠 Maintenance: {m}", "adm:maint")],
+        [styled_button("📡 Account Status", "adm:acc")],
         [styled_button("🎨 Look & Emoji", "adm:look")],
         [styled_button("👥 Approved Users", "adm:users")],
         [styled_button("💎 Subscriptions", "sadm:home")],  # NEW
@@ -4656,6 +4719,16 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (f"👥 <b>APPROVED USERS</b>\n\nAdmin: <code>{ADMIN_ID}</code>\n"
                 + ("\n".join(f"• <code>{u}</code>" for u in ops) if ops else "No other users.")
                 + "\n\nUse /add &lt;uid&gt; and /rem &lt;uid&gt; to change access.")
+    elif action == "acc":
+        text = await account_status_text()
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data="adm:acc")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="adm:home")]]))
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                log.warning("account status view failed: %s", exc)
+        return
     elif action == "back":
         return await _route_label(update, context, "⬅️ Back")
     try:
@@ -4933,7 +5006,7 @@ def main():
     app.add_handler(CommandHandler("start", authorized_handler(start)))
     app.add_handler(CallbackQueryHandler(authorized_handler(main_menu_callback), pattern=r"^main:(?:promotion|posts|accounts|autoreply|bio|monitoring)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
-    app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back)$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back|acc)$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji|front|fbio)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+)|frt:[er]|fbio:(?:t|tg|run))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
