@@ -2,7 +2,7 @@ import asyncio
 import random
 from datetime import datetime, timezone
 
-from pymongo import ASCENDING, MongoClient, ReturnDocument
+from storage import ASCENDING, DBClient as MongoClient, ReturnDocument
 
 
 class Database:

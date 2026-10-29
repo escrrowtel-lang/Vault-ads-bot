@@ -21,8 +21,7 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from storage import ASCENDING, DESCENDING, DuplicateKeyError, DBClient as MongoClient, IndexModel, ReturnDocument
 
 log = logging.getLogger("promo-bot.subs")
 UTC = timezone.utc

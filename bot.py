@@ -425,7 +425,7 @@ BOT_ACCOUNT_STATUS: dict[tuple[int, int], str] = {}
 OPERATORS_DIR = Path(os.getenv("OPERATORS_DIR", "operators"))
 
 # Owner-only operator access list; a separate collection from encrypted sessions.
-from pymongo import MongoClient as _AccessMongoClient
+from storage import DBClient as _AccessMongoClient
 _access_mongo = _AccessMongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
 operator_access = _access_mongo[MONGO_DB]["approved_operators"]
 
