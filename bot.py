@@ -411,6 +411,14 @@ class RuntimeStats:
 # The current operator is bound to each bot update and inherited by background
 # tasks. Persistent tenant settings/posts/sessions are isolated by owner_id in MongoDB.
 CURRENT_OPERATOR = contextvars.ContextVar("operator", default=ADMIN_ID)
+
+
+def _reset_operator(token):
+    """Restore the previous operator. Safe when the task was closed in another context."""
+    try:
+        CURRENT_OPERATOR.reset(token)
+    except (ValueError, RuntimeError):
+        pass
 APPROVED_USERS: set[int] = {ADMIN_ID}
 TENANT_DB: dict[int, Database] = {}
 TENANT_SESSIONS: dict[int, MongoSessionStore] = {}
@@ -734,7 +742,7 @@ async def initialize_tenant(uid: int):
             await db.set_setting("group_delay_seconds", str(GROUP_DELAY_SECONDS))
         stats.group_delay_seconds = await get_group_delay()
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 def retry_after_seconds(value) -> float:
     """Normalize PTB RetryAfter value (number or timedelta) to seconds."""
@@ -748,7 +756,7 @@ async def bot_group_reply_enabled_for(owner_uid: int) -> bool:
     try:
         return (await db.get_setting("bot_group_reply_enabled", "true")).lower() in {"true", "1", "yes", "on"}
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 
 async def bot_group_reply_cooldown_for(owner_uid: int) -> int:
@@ -761,7 +769,7 @@ async def bot_group_reply_cooldown_for(owner_uid: int) -> int:
         except (TypeError, ValueError):
             return BOT_GROUP_REPLY_COOLDOWN_SECONDS
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 
 async def bot_group_reply_post_for(owner_uid: int):
@@ -773,7 +781,7 @@ async def bot_group_reply_post_for(owner_uid: int):
             mode = "rotate"
         return await db.next_reply_post(mode)
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 
 async def bot_dm_auto_reply_text_for(owner_uid: int) -> str:
@@ -782,7 +790,7 @@ async def bot_dm_auto_reply_text_for(owner_uid: int) -> str:
     try:
         return await db.get_setting("control_bot_dm_text", DM_AUTO_REPLY_TEXT)
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 
 async def send_bot_saved_post_reply(api_bot: Bot, chat_id: int, reply_to_message_id: int, post: dict):
@@ -1004,7 +1012,7 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
             except Exception:
                 pass
         BOT_ACCOUNT_TASKS.pop(key, None)
-        CURRENT_OPERATOR.reset(token_ctx)
+        _reset_operator(token_ctx)
 
 
 async def start_bot_account_listener(app: Application, owner_uid: int, bot_id: int):
@@ -1035,7 +1043,7 @@ async def sync_bot_account_listeners(app: Application, owner_uid: int):
         rows = await db.list_bot_accounts()
         wanted = {int(r["bot_id"]) for r in rows if r.get("enabled", True)}
     finally:
-        CURRENT_OPERATOR.reset(token_ctx)
+        _reset_operator(token_ctx)
     for bid in wanted:
         await start_bot_account_listener(app, owner_uid, bid)
     for (uid, bid), task in list(BOT_ACCOUNT_TASKS.items()):
@@ -1052,7 +1060,7 @@ async def start_tenant_listener(app, uid: int):
         LISTENER_TASKS[uid] = asyncio.create_task(account_auto_reply_service(app),
                                                   name=f"account_dm_auto_reply_{uid}")
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 
 def normalize_join_link(raw: str):
@@ -1169,7 +1177,7 @@ async def join_queue_service(app: Application, owner_uid: int):
             await asyncio.sleep(5)
     finally:
         JOIN_QUEUE_TASKS.pop(owner_uid, None)
-        CURRENT_OPERATOR.reset(token_ctx)
+        _reset_operator(token_ctx)
 
 
 async def start_join_queue_service(app: Application, owner_uid: int):
@@ -1202,7 +1210,7 @@ def authorized_handler(handler):
         try:
             return await handler(update, context)
         finally:
-            CURRENT_OPERATOR.reset(token)
+            _reset_operator(token)
     return wrapped
 
 
@@ -1401,7 +1409,7 @@ async def _adopt_shared_client(row: dict, client: TelegramClient) -> TelegramCli
         try:
             return await handler(event)
         finally:
-            CURRENT_OPERATOR.reset(token)
+            _reset_operator(token)
 
     me = await client.get_me()
     my_id = me.id
@@ -1411,7 +1419,7 @@ async def _adopt_shared_client(row: dict, client: TelegramClient) -> TelegramCli
         try:
             await handle_group_join_event(event, sid, my_id)
         finally:
-            CURRENT_OPERATOR.reset(token)
+            _reset_operator(token)
 
     async def scoped_group_message(event):
         if not getattr(event, "is_group", False):
@@ -1420,7 +1428,7 @@ async def _adopt_shared_client(row: dict, client: TelegramClient) -> TelegramCli
         try:
             await remember_group_from_event(event, sid)
         finally:
-            CURRENT_OPERATOR.reset(token)
+            _reset_operator(token)
 
     client.add_event_handler(scoped_dm, events.NewMessage(incoming=True))
     client.add_event_handler(scoped_group_join, events.ChatAction())
@@ -2991,7 +2999,7 @@ async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.gather(*(close_account_client(str(row["id"])) for row in rows),
                              return_exceptions=True)
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
     await update.message.reply_text(f"🚫 Removed {uid}. Their sessions/data remain isolated and cannot be used without access.")
 
 
@@ -3036,7 +3044,7 @@ async def sub_revoke_access(app: Application, uid: int):
         await asyncio.gather(*(close_account_client(str(row["id"])) for row in rows),
                              return_exceptions=True)
     finally:
-        CURRENT_OPERATOR.reset(token)
+        _reset_operator(token)
 
 
 async def sub_start(app: Application):
@@ -4089,7 +4097,7 @@ async def enforce_free_bio_tags(tag: str) -> dict:
                     counts["failed"] += 1
                     log.warning("free bio check failed for %s: %s", row.get("id"), type(e).__name__)
         finally:
-            CURRENT_OPERATOR.reset(token)
+            _reset_operator(token)
     return counts
 
 
