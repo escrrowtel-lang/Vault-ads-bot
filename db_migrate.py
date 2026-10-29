@@ -26,6 +26,12 @@ import sys
 
 from bson import json_util
 
+try:  # same .env the bot uses, so MONGO_URI does not need to be exported in the shell
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 FORMAT = "promo-bot-migration"
 VERSION = 1
 BATCH = 1000
