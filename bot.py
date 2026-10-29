@@ -42,6 +42,7 @@ from database import Database, MongoSessionStore
 from pacing import AccountPacer
 import subscriptions as subs_core          # NEW: subscriptions + Razorpay
 import subscription_ui as subs_ui          # NEW: purchase flow + admin section
+from rich_ui import post_rich, rich_table, heading, para, footer
 
 load_dotenv()
 
@@ -621,16 +622,32 @@ async def send_account_telemetry(update, kind):
     for row in rows:
         sid = str(row['id'])
         if kind == 'stats':
-            blocks = []
-            for mode in ('promo', 'dm'):
-                metric = ACCOUNT_METRICS.get(metric_key(sid, mode))
-                if metric:
-                    blocks.append(account_stats_text(metric))
-            if not blocks:
-                blocks.append(f"👤 <b>{esc(row['label'])}</b>\nNo sending activity since restart.")
-            # Separate message for each account, with distinct promo and DM sections.
-            for block in blocks:
-                await update.message.reply_text(block, parse_mode=ParseMode.HTML, reply_markup=MENU)
+            metrics = [m for m in (ACCOUNT_METRICS.get(metric_key(sid, mode)) for mode in ('promo', 'dm')) if m]
+            if not metrics:
+                await post_rich(
+                    update.message,
+                    [heading(f"👤 {row['label']}"), para("No sending activity since restart.")],
+                    f"👤 <b>{esc(row['label'])}</b>\nNo sending activity since restart.",
+                    MENU,
+                )
+                continue
+            mode_name = lambda m: "Group promo" if m["kind"] == "promo" else "DM broadcast"
+            table_rows = [
+                [mode_name(m), m["status"], f"{m['attempted']}/{m['total']}", m["sent"], m["failed"],
+                 m["skipped"], m["flood_waits"]]
+                for m in metrics
+            ]
+            blocks = [heading(f"📊 {row['label']}"),
+                      rich_table(["Mode", "State", "Progress", "Sent", "Failed", "Skipped", "Flood"], table_rows,
+                                 ["left", "left", "center", "center", "center", "center", "center"])]
+            for m in metrics:
+                blocks.append(para(f"{mode_name(m)}: group sends {m['group_sent']} · DM sends {m['user_sent']} "
+                                   f"· current: {str(m['target'])[:100]}"))
+                if m.get("last_error"):
+                    blocks.append(para(f"{mode_name(m)} last error: {str(m['last_error'])[:160]}"))
+            # One message per account; promo and DM are rows in the same table.
+            await post_rich(update.message, blocks, "\n\n".join(account_stats_text(m) for m in metrics), MENU)
+            continue
         else:
             for mode in ('promo', 'dm'):
                 key = metric_key(sid, mode)
@@ -1277,6 +1294,31 @@ async def schedule_text() -> str:
         "Start/Stop: ▶️ Start Promo / ⏹ Stop Promo\n"
         "Change interval: ⏱ Interval"
     )
+
+
+def live_stats_rich():
+    """Blocks for the rich Live Stats message. The fallback is the HTML text version."""
+    total_targets = stats.total_groups + stats.total_users
+    pct = (stats.attempted / total_targets * 100) if total_targets else 0
+    elapsed = fmt_duration(time.time() - stats.started_at) if stats.started_at else "-"
+    next_run = fmt_duration(stats.next_round_at - time.time()) if stats.next_round_at else "-"
+    blocks = [
+        heading("📊 Live Promotion Stats"),
+        para(f"Status: {'🟢 Running' if stats.running else '🔴 Stopped'} · Round {stats.round_no} · Next round in {next_run}"),
+        para(f"Active posts: {stats.active_posts} · Mode: {str(stats.post_mode).title()} · Current post: {stats.current_post}"),
+        para(f"Overall: {stats.attempted}/{total_targets} ({pct:.1f}%) · Elapsed {elapsed}"),
+        rich_table(
+            ["Audience", "Total", "Tried", "Sent", "Failed", "Skipped"],
+            [
+                ["Groups", stats.total_groups, stats.group_attempted, stats.group_sent, stats.group_failed, stats.group_skipped],
+                ["Opt-in users", stats.total_users, stats.user_attempted, stats.user_sent, stats.user_failed, stats.user_skipped],
+            ],
+            ["left", "center", "center", "center", "center", "center"],
+        ),
+        para(f"Flood waits: {stats.flood_waits} · Paused IDs: {stats.paused_sessions} · Min group gap: {stats.group_delay_seconds}s"),
+        footer(f"Last error: {str(stats.last_error)[:300]}" if stats.last_error else "No recent errors."),
+    ]
+    return blocks, stats_text()
 
 
 def stats_text() -> str:
@@ -2172,9 +2214,9 @@ async def group_targets_view(page: int = 0, note: str = ""):
             rich_rows.append([str(i), name[:40], "YES" if picked else "no", accts])
             html_rows.append([i, name, "YES" if picked else "no", accts])
         blocks.append(_rich_table(["#", "Group", "Picked", "Accounts"], rich_rows, ["center", "left", "center", "center"]))
-        footer = f"Page {page + 1} of {total_pages}. Tap Manage on a group to open it."
-        blocks.append({"type": "footer", "text": footer})
-        html_lines += ["", _table(["#", "Group", "Picked", "Accts"], html_rows, [3, 26, 6, 5]), footer]
+        page_note = f"Page {page + 1} of {total_pages}. Tap Manage on a group to open it."
+        blocks.append({"type": "footer", "text": page_note})
+        html_lines += ["", _table(["#", "Group", "Picked", "Accts"], html_rows, [3, 26, 6, 5]), page_note]
 
     rows = []
     for key, (peer, name) in shown_or_empty(names, page):
@@ -4859,19 +4901,28 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No bot accounts added.", reply_markup=BOT_ACCOUNT_MENU)
             return
         blocks = ["📊 <b>BOT ACCOUNT STATS</b>"]
+        table_rows = []
         for row in rows:
             bid = int(row["bot_id"])
             label = row.get("first_name") or ("@" + row.get("username") if row.get("username") else str(bid))
             status = BOT_ACCOUNT_STATUS.get((uid, bid), "🟡 STARTING" if row.get("enabled", True) else "⚪ DISABLED")
             gcount = await db.count_bot_groups(bid)
             st = await db.bot_event_stats(bid)
+            table_rows.append([label, status, gcount, st["sent"], st["skipped"], st["failed"]])
             blocks.append(
                 f"{status} <b>{esc(label)}</b>\n"
                 f"👥 Known groups: <b>{gcount}</b>\n"
                 f"✅ Replies: <b>{st['sent']}</b> (Groups {st['group_sent']} • DMs {st['dm_sent']})\n"
                 f"⏭ Skipped: <b>{st['skipped']}</b> • ❌ Failed: <b>{st['failed']}</b>"
             )
-        await update.message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, reply_markup=BOT_ACCOUNT_MENU)
+        await post_rich(
+            update.message,
+            [heading("📊 Bot Account Stats"),
+             rich_table(["Bot", "Status", "Groups", "Replies", "Skipped", "Failed"], table_rows,
+                        ["left", "left", "center", "center", "center", "center"])],
+            "\n\n".join(blocks),
+            BOT_ACCOUNT_MENU,
+        )
         return
 
     if text == "📜 Bot Logs":
@@ -5207,7 +5258,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📊 Live Stats":
         stats.active_posts = len(await db.list_posts(enabled_only=True))
         stats.post_mode = await db.get_setting("post_mode", "rotate")
-        await update.message.reply_text(stats_text(), parse_mode=ParseMode.HTML, reply_markup=MENU)
+        blocks, fallback = live_stats_rich()
+        await post_rich(update.message, blocks, fallback, MENU)
 
     else:
         await update.message.reply_text("Use the menu buttons below.", reply_markup=MENU)
