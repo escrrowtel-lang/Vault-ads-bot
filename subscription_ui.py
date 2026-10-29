@@ -380,9 +380,15 @@ async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
     markup = InlineKeyboardMarkup(rows)
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Forbidden:
+        log.info("user %s blocked the bot; welcome not delivered", user.id)
+        raise ApplicationHandlerStop
     except BadRequest:
         log.warning("welcome text rejected by Telegram; sending default")
-        await update.message.reply_text(DEFAULT_WELCOME, parse_mode=ParseMode.HTML, reply_markup=markup)
+        try:
+            await update.message.reply_text(DEFAULT_WELCOME, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Forbidden:
+            log.info("user %s blocked the bot; welcome not delivered", user.id)
     raise ApplicationHandlerStop
 
 
