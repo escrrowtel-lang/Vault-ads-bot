@@ -2085,6 +2085,51 @@ async def ensure_group_cache(timeout: float = 25.0) -> int:
     return sum(1 for r in rows if str(r["id"]) not in target_cache)
 
 
+def _rich_cell(text, header=False, align="left"):
+    return {"text": str(text), "is_header": header, "colspan": 1, "rowspan": 1, "align": align, "valign": "middle"}
+
+
+def _rich_table(headers, rows, aligns):
+    cells = [[_rich_cell(h, True, a) for h, a in zip(headers, aligns)]]
+    cells += [[_rich_cell(c, False, a) for c, a in zip(r, aligns)] for r in rows]
+    return {"type": "table", "cells": cells, "is_bordered": True, "is_striped": True, "is_compact": True}
+
+
+async def send_group_screen(message, view: dict, markup):
+    """Send a Telegram rich table message. Falls back to HTML text if the API refuses it."""
+    try:
+        await message.get_bot()._post("sendRichMessage", {
+            "chat_id": message.chat_id,
+            "rich_message": {"blocks": view["blocks"]},
+            "reply_markup": markup.to_dict(),
+        })
+        return
+    except Exception as exc:
+        log.warning("rich table send failed, using HTML fallback: %s", type(exc).__name__)
+    await message.reply_text(view["fallback"], parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def edit_group_screen(message, view: dict, markup):
+    """Edit the screen in place as a rich table. Falls back to HTML text if needed."""
+    try:
+        await message.get_bot()._post("editMessageText", {
+            "chat_id": message.chat_id,
+            "message_id": message.message_id,
+            "rich_message": {"blocks": view["blocks"]},
+            "reply_markup": markup.to_dict(),
+        })
+        return
+    except Exception as exc:
+        if "not modified" in str(exc).lower():
+            return
+        log.warning("rich table edit failed, using HTML fallback: %s", type(exc).__name__)
+    try:
+        await message.edit_text(view["fallback"], parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            log.warning("target groups fallback edit failed: %s", exc)
+
+
 async def group_targets_view(page: int = 0, note: str = ""):
     still_loading = await ensure_group_cache()
     if still_loading and not note:
@@ -2096,25 +2141,43 @@ async def group_targets_view(page: int = 0, note: str = ""):
     total_pages = max(1, -(-len(names) // GT_PAGE))
     page = max(0, min(page, total_pages - 1))
     mode = "✅ Selected groups only" if gt["mode"] == "selected" else "🌐 All groups"
-    lines = ["🎯 <b>TARGET GROUPS</b>", "",
-             f"Mode: <b>{mode}</b>",
-             f"Selected: <b>{len(gt['groups'])}</b> of <b>{'unlimited' if limit is None else limit}</b> allowed on your plan"]
+    allowed = "unlimited" if limit is None else str(limit)
+    summary = [f"Mode: {mode}", f"Selected: {len(gt['groups'])} of {allowed} allowed on your plan"]
     if gt["mode"] == "all":
-        lines.append("<i>All groups are used. Switch to selected mode to choose groups.</i>")
+        summary.append("All groups are used. Switch to selected mode to choose groups.")
+
+    blocks = [{"type": "heading", "text": "🎯 Target Groups", "size": 2}]
     if note:
-        lines = [note, ""] + lines
+        blocks.append({"type": "paragraph", "text": note})
+    blocks += [{"type": "paragraph", "text": line} for line in summary]
+
+    html_lines = ["🎯 <b>TARGET GROUPS</b>", "", f"Mode: <b>{mode}</b>",
+                  f"Selected: <b>{len(gt['groups'])}</b> of <b>{allowed}</b> allowed on your plan"]
+    if gt["mode"] == "all":
+        html_lines.append("<i>All groups are used. Switch to selected mode to choose groups.</i>")
+    if note:
+        html_lines = [note, ""] + html_lines
+
     if not names:
-        lines += ["", "No groups yet. Tap 🔄 Rescan Targets in Promotion, then come back here."]
+        msg = "No groups yet. Tap 🔄 Rescan Targets in Promotion, then come back here."
+        blocks.append({"type": "paragraph", "text": msg})
+        html_lines += ["", msg]
     else:
         shown = names[page * GT_PAGE:(page + 1) * GT_PAGE]
-        table_rows = []
+        rich_rows, html_rows = [], []
         for i, (key, (peer, name)) in enumerate(shown, start=page * GT_PAGE + 1):
-            table_rows.append([i, name, "YES" if key in gt["groups"] else "no",
-                               len(gt["groups"].get(key, {}).get("accounts") or []) if key in gt["groups"] else "-"])
-        lines += ["", _table(["#", "Group", "Picked", "Accts"], table_rows, [3, 26, 6, 5]),
-                  f"Page {page + 1} of {total_pages}. Tap Manage on a group to open it."]
+            info = gt["groups"].get(key)
+            picked = info is not None
+            accts = "-" if not picked else ("all" if info["accounts"] is None else str(len(info["accounts"])))
+            rich_rows.append([str(i), name[:40], "YES" if picked else "no", accts])
+            html_rows.append([i, name, "YES" if picked else "no", accts])
+        blocks.append(_rich_table(["#", "Group", "Picked", "Accounts"], rich_rows, ["center", "left", "center", "center"]))
+        footer = f"Page {page + 1} of {total_pages}. Tap Manage on a group to open it."
+        blocks.append({"type": "footer", "text": footer})
+        html_lines += ["", _table(["#", "Group", "Picked", "Accts"], html_rows, [3, 26, 6, 5]), footer]
+
     rows = []
-    for key, (peer, name) in names[page * GT_PAGE:(page + 1) * GT_PAGE]:
+    for key, (peer, name) in shown_or_empty(names, page):
         on = key in gt["groups"]
         rows.append([InlineKeyboardButton(f"{'✅' if on else '⬜'} {name[:24]}  ·  Manage",
                                           callback_data=f"gt.m.{key}.{page}")])
@@ -2128,7 +2191,11 @@ async def group_targets_view(page: int = 0, note: str = ""):
     rows.append([InlineKeyboardButton("🌐 Use all groups" if gt["mode"] == "selected" else "✅ Use selected only",
                                       callback_data="gt.mode")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="main:promotion")])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return {"blocks": blocks, "fallback": "\n".join(html_lines)}, InlineKeyboardMarkup(rows)
+
+
+def shown_or_empty(names, page):
+    return names[page * GT_PAGE:(page + 1) * GT_PAGE]
 
 
 async def group_manage_view(key: str, page: int, gt: dict, groups: dict, note: str = ""):
@@ -2137,25 +2204,41 @@ async def group_manage_view(key: str, page: int, gt: dict, groups: dict, note: s
     accounts = (await session_store.get_sessions(enabled_only=True))[:40]
     on_group = info is not None
     posting = 0
-    table_rows = []
+    rich_rows = []
     for i, row in enumerate(accounts, start=1):
         sid = str(row["id"])
         on = on_group and (info["accounts"] is None or sid in info["accounts"])
         posting += on
-        table_rows.append([i, row.get("label", sid), "YES" if on else "no"])
-    lines = [f"📣 <b>{esc(name)}</b>", "",
-             f"Group: <b>{'✅ Selected' if on_group else '⬜ Not selected'}</b>"]
+        rich_rows.append([str(i), str(row.get("label", sid)), "YES" if on else "no"])
+    status = "✅ Selected" if on_group else "⬜ Not selected"
+    summary = [f"Group: {status}"]
     if on_group:
-        lines.append(f"Accounts posting here: <b>{posting}</b> of <b>{len(accounts)}</b>")
+        summary.append(f"Accounts posting here: {posting} of {len(accounts)}")
     if gt["mode"] == "all":
-        lines.append("<i>Mode is All groups, so these settings apply only in selected-groups mode.</i>")
+        summary.append("Mode is All groups, so these settings apply only in selected-groups mode.")
+
+    blocks = [{"type": "heading", "text": f"📣 {name}", "size": 2}]
     if note:
-        lines = [note, ""] + lines
-    if table_rows:
-        lines += ["", _table(["#", "Account", "Posts here"], table_rows, [3, 24, 10]),
-                  "Tap an account below to allow or block it."]
+        blocks.append({"type": "paragraph", "text": note})
+    blocks += [{"type": "paragraph", "text": line} for line in summary]
+
+    html_lines = [f"📣 <b>{esc(name)}</b>", "", f"Group: <b>{status}</b>"]
+    if on_group:
+        html_lines.append(f"Accounts posting here: <b>{posting}</b> of <b>{len(accounts)}</b>")
+    if gt["mode"] == "all":
+        html_lines.append("<i>Mode is All groups, so these settings apply only in selected-groups mode.</i>")
+    if note:
+        html_lines = [note, ""] + html_lines
+    if rich_rows:
+        blocks.append(_rich_table(["#", "Account", "Posts here"], rich_rows, ["center", "left", "center"]))
+        blocks.append({"type": "footer", "text": "Tap an account below to allow or block it."})
+        html_lines += ["", _table(["#", "Account", "Posts here"], rich_rows, [3, 24, 10]),
+                       "Tap an account below to allow or block it."]
     else:
-        lines += ["", "No active accounts. Add a session in Accounts first."]
+        msg = "No active accounts. Add a session in Accounts first."
+        blocks.append({"type": "paragraph", "text": msg})
+        html_lines += ["", msg]
+
     rows = [[InlineKeyboardButton("➖ Remove from selected" if on_group else "➕ Select this group",
                                   callback_data=f"gt.t.{key}.{page}")]]
     for row in accounts:
@@ -2167,7 +2250,7 @@ async def group_manage_view(key: str, page: int, gt: dict, groups: dict, note: s
     if link:
         rows.append([InlineKeyboardButton("🔗 Open group", url=link)])
     rows.append([InlineKeyboardButton("⬅️ Back to groups", callback_data=f"gt.p.{page}")])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+    return {"blocks": blocks, "fallback": "\n".join(html_lines)}, InlineKeyboardMarkup(rows)
 
 
 async def group_targets_callback(update, context):
@@ -2223,11 +2306,7 @@ async def group_targets_callback(update, context):
         text, markup = await group_manage_view(key, page, gt, groups)
     else:
         return await q.answer()
-    try:
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
-    except BadRequest as exc:
-        if "not modified" not in str(exc).lower():
-            log.warning("target groups view failed: %s", exc)
+    await edit_group_screen(q.message, text, markup)
 
 
 async def apply_target_rules(sid: str, groups: list, users: list):
@@ -5094,7 +5173,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=PROMOTION_MENU)
     elif text == "🎯 Target Groups":
         view, markup = await group_targets_view(0)
-        await update.message.reply_text(view, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await send_group_screen(update.message, view, markup)
     elif text == "📨 DM Broadcast":
         if (await db.get_setting("dm_broadcast_enabled", "1")) != "1":
             await update.message.reply_text("🔴 DM broadcast is OFF. Turn it on with 🔘 DM Broadcast On/Off.", reply_markup=PROMOTION_MENU)
