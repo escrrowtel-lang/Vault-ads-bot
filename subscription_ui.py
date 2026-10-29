@@ -16,7 +16,7 @@ from telegram.ext import (ApplicationHandlerStop, CallbackQueryHandler, CommandH
                           MessageHandler, filters)
 
 import subscriptions as S
-from rich_ui import edit_rich, heading, para, footer, rich_table
+from rich_ui import edit_screen, heading, para, footer, rich_table, button_cell
 
 log = logging.getLogger("promo-bot.subs.ui")
 CFG = {"admin_id": 0, "approved": set(), "back_to_main": None}
@@ -56,7 +56,7 @@ def duration_label(days: int) -> str:
 
 async def _edit(q, text, rows):
     if isinstance(text, dict):
-        return await edit_rich(q.message, text["blocks"], text["fallback"], InlineKeyboardMarkup(rows))
+        return await edit_screen(q.message, text, InlineKeyboardMarkup(rows))
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows),
                                   disable_web_page_preview=True)
@@ -138,24 +138,36 @@ async def home_view(uid: int):
     lines = ["💎 <b>SUBSCRIPTION PLANS</b>", "", _sub_line(sub), "", "Choose a duration:"]
     rows = []
     table_rows = []
+    days_of = []
     if not plans:
         lines.append("No plans are available right now. Please contact the owner.")
     for days in sorted({int(p["duration_days"]) for p in plans}):
         group = [p for p in plans if int(p["duration_days"]) == days]
         cheapest = min(p["price_paise"] for p in group)
+        days_of.append(days)
         table_rows.append([duration_label(days), S.fmt_inr(cheapest), str(len(group))])
         rows.append([B(f"📅 {duration_label(days)} · from {S.fmt_inr(cheapest)}", f"sub:dur:{days}")])
     if not S.payments_configured():
         lines += ["", "⚠️ Online payments are not enabled yet."]
     rows.append([B("📊 My Subscription", "sub:my")])
     rows.append([B("⬅️ Back", "sub:back")])
-    blocks = [heading("💎 Subscription Plans"), para(re.sub(r"<[^>]+>", "", html.unescape(_sub_line(sub))))]
+    status = para(re.sub(r"<[^>]+>", "", html.unescape(_sub_line(sub))))
+    aligns = ["left", "center", "center"]
+    blocks = [heading("💎 Subscription Plans"), status]
+    cell_blocks = [heading("💎 Subscription Plans"), status]
     if table_rows:
-        blocks.append(rich_table(["Duration", "From", "Plans"], table_rows, ["left", "center", "center"]))
-        blocks.append(footer("Tap a duration below to see the account plans."))
+        blocks += [rich_table(["Duration", "From", "Plans"], table_rows, aligns),
+                   footer("Tap a duration below to see the account plans.")]
+        cell_rows = [[d, f, c, button_cell("📅 Open", f"sub:dur:{days_of[i]}")] for i, (d, f, c) in enumerate(table_rows)]
+        cell_blocks += [rich_table(["Duration", "From", "Plans", "Open"], cell_rows, aligns + ["center"]),
+                        footer("Tap Open on a duration to see the account plans.")]
     else:
-        blocks.append(para("No plans are available right now. Please contact the owner."))
-    return {"blocks": blocks, "fallback": "\n".join(lines)}, rows
+        msg = para("No plans are available right now. Please contact the owner.")
+        blocks.append(msg)
+        cell_blocks.append(msg)
+    cell_markup = InlineKeyboardMarkup([[B("📊 My Subscription", "sub:my")], [B("⬅️ Back", "sub:back")]])
+    return {"blocks": blocks, "cell_blocks": cell_blocks, "cell_markup": cell_markup,
+            "fallback": "\n".join(lines)}, rows
 
 
 async def duration_view(days: int):
@@ -164,7 +176,9 @@ async def duration_view(days: int):
     lines = [f"📅 <b>{duration_label(days)}</b>", "", "Choose how many accounts you need:", ""]
     rows = []
     table_rows = []
+    plan_ids = []
     for p in plans:
+        plan_ids.append(p["plan_id"])
         caps = S.caps_for_plan(p)
         accts = "unlimited" if caps["max_accounts"] is None else caps["max_accounts"]
         groups_txt = "unlimited" if caps["max_groups"] is None else str(caps["max_groups"])
@@ -174,13 +188,23 @@ async def duration_view(days: int):
     if not plans:
         lines.append("No plans for this duration right now.")
     rows.append([B("⬅️ Back", "sub:home")])
-    blocks = [heading(duration_label(days)), para("Choose how many accounts you need.")]
+    aligns = ["center", "center", "center"]
+    intro = para("Choose how many accounts you need.")
+    blocks = [heading(duration_label(days)), intro]
+    cell_blocks = [heading(duration_label(days)), intro]
+    cell_markup = InlineKeyboardMarkup([[B("⬅️ Back", "sub:home")]])
     if table_rows:
-        blocks.append(rich_table(["Accounts", "Price", "Groups"], table_rows, ["center", "center", "center"]))
-        blocks.append(footer("Tap a plan below to buy it."))
+        blocks += [rich_table(["Accounts", "Price", "Groups"], table_rows, aligns),
+                   footer("Tap a plan below to buy it.")]
+        cell_rows = [r + [button_cell("🛒 Buy", f"sub:plan:{pid}")] for r, pid in zip(table_rows, plan_ids)]
+        cell_blocks += [rich_table(["Accounts", "Price", "Groups", "Buy"], cell_rows, aligns + ["center"]),
+                        footer("Tap Buy on the plan you want.")]
     else:
-        blocks.append(para("No plans for this duration right now."))
-    return {"blocks": blocks, "fallback": "\n".join(lines)}, rows
+        msg = para("No plans for this duration right now.")
+        blocks.append(msg)
+        cell_blocks.append(msg)
+    return {"blocks": blocks, "cell_blocks": cell_blocks, "cell_markup": cell_markup,
+            "fallback": "\n".join(lines)}, rows
 
 
 async def my_view(uid: int):
