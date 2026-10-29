@@ -2051,6 +2051,17 @@ async def available_groups() -> dict:
     return found
 
 
+def _table(headers, rows, widths):
+    """Monospace table for a <pre> block. Cells are truncated to their width and HTML-escaped."""
+    def cell(text, width):
+        text = str(text)
+        text = text if len(text) <= width else text[:width - 1] + "…"
+        return text.ljust(width)
+    head = "  ".join(cell(h, w) for h, w in zip(headers, widths))
+    body = ["  ".join(cell(c, w) for c, w in zip(r, widths)) for r in rows]
+    return "<pre>" + esc("\n".join([head, "-" * len(head)] + body)) + "</pre>"
+
+
 async def group_targets_view(page: int = 0, note: str = ""):
     gt = await load_group_targets()
     groups = await available_groups()
@@ -2061,22 +2072,26 @@ async def group_targets_view(page: int = 0, note: str = ""):
     mode = "✅ Selected groups only" if gt["mode"] == "selected" else "🌐 All groups"
     lines = ["🎯 <b>TARGET GROUPS</b>", "",
              f"Mode: <b>{mode}</b>",
-             f"Selected: <b>{len(gt['groups'])}</b> of <b>{'unlimited' if limit is None else limit}</b> allowed on your plan", ""]
+             f"Selected: <b>{len(gt['groups'])}</b> of <b>{'unlimited' if limit is None else limit}</b> allowed on your plan"]
     if gt["mode"] == "all":
-        lines.append("All groups are used. Switch to selected mode to choose groups.")
-    if not names:
-        lines.append("No groups yet. Tap 🔄 Rescan Targets in Promotion, then come back here.")
-    else:
-        lines.append("Tap a group to select or remove it. Tap Manage to choose which accounts post there.")
+        lines.append("<i>All groups are used. Switch to selected mode to choose groups.</i>")
     if note:
         lines = [note, ""] + lines
+    if not names:
+        lines += ["", "No groups yet. Tap 🔄 Rescan Targets in Promotion, then come back here."]
+    else:
+        shown = names[page * GT_PAGE:(page + 1) * GT_PAGE]
+        table_rows = []
+        for i, (key, (peer, name)) in enumerate(shown, start=page * GT_PAGE + 1):
+            table_rows.append([i, name, "YES" if key in gt["groups"] else "no",
+                               len(gt["groups"].get(key, {}).get("accounts") or []) if key in gt["groups"] else "-"])
+        lines += ["", _table(["#", "Group", "Picked", "Accts"], table_rows, [3, 26, 6, 5]),
+                  f"Page {page + 1} of {total_pages}. Tap Manage on a group to open it."]
     rows = []
     for key, (peer, name) in names[page * GT_PAGE:(page + 1) * GT_PAGE]:
         on = key in gt["groups"]
-        rows.append([
-            InlineKeyboardButton(("✅ " if on else "⬜ ") + name[:30], callback_data=f"gt.s.{key}.{page}"),
-            InlineKeyboardButton("Manage", callback_data=f"gt.m.{key}.{page}"),
-        ])
+        rows.append([InlineKeyboardButton(f"{'✅' if on else '⬜'} {name[:24]}  ·  Manage",
+                                          callback_data=f"gt.m.{key}.{page}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"gt.p.{page - 1}"))
@@ -2093,25 +2108,35 @@ async def group_targets_view(page: int = 0, note: str = ""):
 async def group_manage_view(key: str, page: int, gt: dict, groups: dict, note: str = ""):
     info = gt["groups"].get(key)
     name = groups[key][1] if key in groups else (info or {}).get("title", "Group")
-    accounts = await session_store.get_sessions(enabled_only=True)
-    lines = [f"📣 <b>{esc(name)}</b>", ""]
-    if info is None:
-        lines.append("⬜ This group is not selected. Go back and tap it to select it first.")
-    else:
-        allowed = len(accounts) if info["accounts"] is None else len(
-            [a for a in accounts if str(a["id"]) in info["accounts"]])
-        lines.append(f"Accounts that post here: <b>{allowed}</b> of <b>{len(accounts)}</b>")
-        lines.append("Tap an account to allow or block it for this group.")
+    accounts = (await session_store.get_sessions(enabled_only=True))[:40]
+    on_group = info is not None
+    posting = 0
+    table_rows = []
+    for i, row in enumerate(accounts, start=1):
+        sid = str(row["id"])
+        on = on_group and (info["accounts"] is None or sid in info["accounts"])
+        posting += on
+        table_rows.append([i, row.get("label", sid), "YES" if on else "no"])
+    lines = [f"📣 <b>{esc(name)}</b>", "",
+             f"Group: <b>{'✅ Selected' if on_group else '⬜ Not selected'}</b>"]
+    if on_group:
+        lines.append(f"Accounts posting here: <b>{posting}</b> of <b>{len(accounts)}</b>")
     if gt["mode"] == "all":
-        lines.append("\n<i>Mode is All groups, so these settings apply only in selected-groups mode.</i>")
+        lines.append("<i>Mode is All groups, so these settings apply only in selected-groups mode.</i>")
     if note:
         lines = [note, ""] + lines
-    rows = []
+    if table_rows:
+        lines += ["", _table(["#", "Account", "Posts here"], table_rows, [3, 24, 10]),
+                  "Tap an account below to allow or block it."]
+    else:
+        lines += ["", "No active accounts. Add a session in Accounts first."]
+    rows = [[InlineKeyboardButton("➖ Remove from selected" if on_group else "➕ Select this group",
+                                  callback_data=f"gt.t.{key}.{page}")]]
     for row in accounts:
         sid = str(row["id"])
-        on = info is not None and (info["accounts"] is None or sid in info["accounts"])
-        rows.append([InlineKeyboardButton(("✅ " if on else "⬜ ") + str(row.get("label", sid))[:40],
-                                          callback_data=f"gt.a.{key}.{sid}.{page}")])
+        on = on_group and (info["accounts"] is None or sid in info["accounts"])
+        rows.append([InlineKeyboardButton(f"{'✅' if on else '⬜'} {str(row.get('label', sid))[:30]}  ·  "
+                                          f"{'YES' if on else 'no'}", callback_data=f"gt.a.{key}.{sid}.{page}")])
     link = GROUP_LINKS.get(key)
     if link:
         rows.append([InlineKeyboardButton("🔗 Open group", url=link)])
@@ -2136,11 +2161,16 @@ async def group_targets_callback(update, context):
         await save_group_targets(gt)
         await q.answer()
         text, markup = await group_targets_view(0)
-    elif act == "s":
+    elif act == "m":
+        await q.answer()
         key, page = f"{parts[2]}.{parts[3]}", int(parts[4])
+        text, markup = await group_manage_view(key, page, gt, groups)
+    elif act == "t":
+        key, page = f"{parts[2]}.{parts[3]}", int(parts[4])
+        note = ""
         if key in gt["groups"]:
             del gt["groups"][key]
-            await save_group_targets(gt)
+            note = "➖ Removed from selected groups."
             await q.answer()
         elif key not in groups:
             return await q.answer("Group not found. Rescan targets first.", show_alert=True)
@@ -2148,18 +2178,15 @@ async def group_targets_callback(update, context):
             return await q.answer(f"Your plan allows {limit} groups. Upgrade for more.", show_alert=True)
         else:
             gt["groups"][key] = {"title": groups[key][1], "accounts": None}
-            await save_group_targets(gt)
+            note = "✅ Group selected."
             await q.answer()
-        text, markup = await group_targets_view(page)
-    elif act == "m":
-        await q.answer()
-        key, page = f"{parts[2]}.{parts[3]}", int(parts[4])
-        text, markup = await group_manage_view(key, page, gt, groups)
+        await save_group_targets(gt)
+        text, markup = await group_manage_view(key, page, gt, groups, note)
     elif act == "a":
         key, sid, page = f"{parts[2]}.{parts[3]}", parts[4], int(parts[5])
         info = gt["groups"].get(key)
         if info is None:
-            return await q.answer("Select this group first.", show_alert=True)
+            return await q.answer("Select this group first (➕ Select this group).", show_alert=True)
         all_ids = {str(r["id"]) for r in await session_store.get_sessions(enabled_only=True)}
         current = set(all_ids) if info["accounts"] is None else set(info["accounts"])
         current ^= {sid}
