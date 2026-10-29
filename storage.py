@@ -513,7 +513,7 @@ class Backup:
 
 _ENGINE = None
 _BACKUP = None
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 
 def _get_engine():
