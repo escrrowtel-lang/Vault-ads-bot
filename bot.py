@@ -2062,7 +2062,33 @@ def _table(headers, rows, widths):
     return "<pre>" + esc("\n".join([head, "-" * len(head)] + body)) + "</pre>"
 
 
+async def ensure_group_cache(timeout: float = 25.0) -> int:
+    """Scan groups for enabled accounts that have no cache yet (e.g. after a restart).
+
+    Returns how many accounts are still missing a cache after the attempt.
+    """
+    rows = await session_store.get_sessions(enabled_only=True)
+    missing = [r for r in rows if str(r["id"]) not in target_cache]
+    if missing:
+        async def _one(r):
+            client = await get_account_client(r)
+            await get_cached_targets(r, client, force=False)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(_one(r) for r in missing), return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            log.warning("group cache scan timed out after %ss", timeout)
+        except Exception as exc:
+            log.warning("group cache scan failed: %s", type(exc).__name__)
+    return sum(1 for r in rows if str(r["id"]) not in target_cache)
+
+
 async def group_targets_view(page: int = 0, note: str = ""):
+    still_loading = await ensure_group_cache()
+    if still_loading and not note:
+        note = f"⏳ {still_loading} account(s) are still loading groups. Tap Target Groups again in a moment."
     gt = await load_group_targets()
     groups = await available_groups()
     limit = (await plan_caps(tenant_id())).get("max_groups")
@@ -2151,6 +2177,7 @@ async def group_targets_callback(update, context):
     parts = q.data.split(".")
     act = parts[1] if len(parts) > 1 else "p"
     gt = await load_group_targets()
+    await ensure_group_cache()
     groups = await available_groups()
     limit = (await plan_caps(tenant_id())).get("max_groups")
     if act == "p":
