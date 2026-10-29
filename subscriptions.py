@@ -33,7 +33,7 @@ REMINDER_DAYS = 3
 SWEEP_SECONDS = 60
 PAGE_SIZE = 8
 # Free trial limits: 1 account, no Bot feature, no AI auto reply.
-TRIAL_CAPS = {"max_accounts": 1, "bot": False, "ai": False}
+TRIAL_CAPS = {"max_accounts": 1, "max_groups": 5, "bot": False, "ai": False}
 TRIAL_DAYS = 7                    # free trial length for every new user (one per Telegram user)
 
 
@@ -97,8 +97,20 @@ def parse_price_paise(text: str) -> int:
 def caps_for_plan(plan) -> dict:
     """Limits of a stored plan. Missing fields on older plans mean no limit / features on."""
     mx = plan.get("max_accounts")
+    mg = plan.get("max_groups")
     return {"max_accounts": None if mx is None else int(mx),
+            "max_groups": 10 if mg is None else int(mg),        # paid plans default to 10 groups
             "bot": bool(plan.get("bot_feature", True)), "ai": bool(plan.get("ai_feature", True))}
+
+
+def parse_groups(text: str) -> int:
+    try:
+        n = int((text or "").strip())
+    except ValueError:
+        raise ValueError("Enter a whole number, e.g. 10.")
+    if not 1 <= n <= 1000:
+        raise ValueError("Groups must be between 1 and 1000.")
+    return n
 
 
 def parse_accounts(text: str) -> int:
@@ -192,7 +204,7 @@ class Store:
                                                 upsert=True, return_document=ReturnDocument.AFTER)["seq"]
         doc = {"owner_id": self.owner_id, "plan_id": str(seq), "plan_no": int(seq), "name": name,
                "price_paise": int(price_paise), "duration_days": int(days), "enabled": True,
-               "max_accounts": 5, "bot_feature": True, "ai_feature": True,
+               "max_accounts": 5, "max_groups": 10, "bot_feature": True, "ai_feature": True,
                "created_at": now_utc(), "updated_at": now_utc()}
         self.plans.insert_one(doc)
         return doc

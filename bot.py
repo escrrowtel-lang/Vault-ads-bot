@@ -187,6 +187,7 @@ PROMOTION_MENU = _inline_from_rows(
         ["▶️ Start Promo", "⏹ Stop Promo"],
         ["⏱ Interval", "⏳ Group Delay"],
         ["🔄 Rescan Targets", "📨 DM Broadcast"],
+        ["🎯 Target Groups", "🔘 DM Broadcast On/Off"],
         ["📅 Schedule"],
         ["🌙 Quiet Hours"],
         ["🎯 Promo Accounts"],
@@ -1588,9 +1589,11 @@ async def scan_targets(client: TelegramClient):
         name = dialog.name or str(dialog.id)
         if isinstance(entity, types.Chat):
             groups.append((await _input_peer(entity), name))
+            _remember_group_link(entity)
             continue
         if isinstance(entity, types.Channel) and getattr(entity, "megagroup", False):
             groups.append((await _input_peer(entity), name))
+            _remember_group_link(entity)
     return groups, []
 
 
@@ -2002,6 +2005,199 @@ async def _run_session_round(row, client, groups, users, posts, mode, progress_m
             log.warning("Final account progress update failed for %s: %s", row.get("label", sid), type(exc).__name__)
 
 
+# ---- Target groups: pick the groups promotions go to, and which accounts post in each one.
+GROUP_LINKS: dict[str, str] = {}      # "channel.123" -> https://t.me/<username> (public groups only)
+GT_PAGE = 8
+
+
+def group_key(peer):
+    """'channel.123' / 'chat.45' for a cached group peer; None for anything else."""
+    kind, ident = _group_peer_key(peer)
+    return f"{kind}.{ident}" if kind in ("chat", "channel") else None
+
+
+def _remember_group_link(entity):
+    username = getattr(entity, "username", None)
+    if username and isinstance(entity, types.Channel):
+        GROUP_LINKS[f"channel.{entity.id}"] = f"https://t.me/{username}"
+
+
+async def load_group_targets() -> dict:
+    try:
+        raw = await db.get_setting("group_targets", "") or ""
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    data.setdefault("mode", "all")
+    data.setdefault("groups", {})
+    return data
+
+
+async def save_group_targets(data: dict):
+    await db.set_setting("group_targets", json.dumps(data, ensure_ascii=False))
+
+
+async def available_groups() -> dict:
+    """key -> (peer, name) for every group this operator's accounts have scanned."""
+    found = {}
+    for row in await session_store.get_sessions(enabled_only=True):
+        cached = target_cache.get(str(row["id"]))
+        if not cached:
+            continue
+        for peer, name in cached["groups"]:
+            key = group_key(peer)
+            if key and key not in found:
+                found[key] = (peer, name)
+    return found
+
+
+async def group_targets_view(page: int = 0, note: str = ""):
+    gt = await load_group_targets()
+    groups = await available_groups()
+    limit = (await plan_caps(tenant_id())).get("max_groups")
+    names = sorted(groups.items(), key=lambda kv: kv[1][1].lower())
+    total_pages = max(1, -(-len(names) // GT_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    mode = "✅ Selected groups only" if gt["mode"] == "selected" else "🌐 All groups"
+    lines = ["🎯 <b>TARGET GROUPS</b>", "",
+             f"Mode: <b>{mode}</b>",
+             f"Selected: <b>{len(gt['groups'])}</b> of <b>{'unlimited' if limit is None else limit}</b> allowed on your plan", ""]
+    if gt["mode"] == "all":
+        lines.append("All groups are used. Switch to selected mode to choose groups.")
+    if not names:
+        lines.append("No groups yet. Tap 🔄 Rescan Targets in Promotion, then come back here.")
+    else:
+        lines.append("Tap a group to select or remove it. Tap Manage to choose which accounts post there.")
+    if note:
+        lines = [note, ""] + lines
+    rows = []
+    for key, (peer, name) in names[page * GT_PAGE:(page + 1) * GT_PAGE]:
+        on = key in gt["groups"]
+        rows.append([
+            InlineKeyboardButton(("✅ " if on else "⬜ ") + name[:30], callback_data=f"gt.s.{key}.{page}"),
+            InlineKeyboardButton("Manage", callback_data=f"gt.m.{key}.{page}"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"gt.p.{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"gt.p.{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🌐 Use all groups" if gt["mode"] == "selected" else "✅ Use selected only",
+                                      callback_data="gt.mode")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="main:promotion")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def group_manage_view(key: str, page: int, gt: dict, groups: dict, note: str = ""):
+    info = gt["groups"].get(key)
+    name = groups[key][1] if key in groups else (info or {}).get("title", "Group")
+    accounts = await session_store.get_sessions(enabled_only=True)
+    lines = [f"📣 <b>{esc(name)}</b>", ""]
+    if info is None:
+        lines.append("⬜ This group is not selected. Go back and tap it to select it first.")
+    else:
+        allowed = len(accounts) if info["accounts"] is None else len(
+            [a for a in accounts if str(a["id"]) in info["accounts"]])
+        lines.append(f"Accounts that post here: <b>{allowed}</b> of <b>{len(accounts)}</b>")
+        lines.append("Tap an account to allow or block it for this group.")
+    if gt["mode"] == "all":
+        lines.append("\n<i>Mode is All groups, so these settings apply only in selected-groups mode.</i>")
+    if note:
+        lines = [note, ""] + lines
+    rows = []
+    for row in accounts:
+        sid = str(row["id"])
+        on = info is not None and (info["accounts"] is None or sid in info["accounts"])
+        rows.append([InlineKeyboardButton(("✅ " if on else "⬜ ") + str(row.get("label", sid))[:40],
+                                          callback_data=f"gt.a.{key}.{sid}.{page}")])
+    link = GROUP_LINKS.get(key)
+    if link:
+        rows.append([InlineKeyboardButton("🔗 Open group", url=link)])
+    rows.append([InlineKeyboardButton("⬅️ Back to groups", callback_data=f"gt.p.{page}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def group_targets_callback(update, context):
+    q = update.callback_query
+    if not q.from_user or not q.message:
+        return await q.answer()
+    parts = q.data.split(".")
+    act = parts[1] if len(parts) > 1 else "p"
+    gt = await load_group_targets()
+    groups = await available_groups()
+    limit = (await plan_caps(tenant_id())).get("max_groups")
+    if act == "p":
+        await q.answer()
+        text, markup = await group_targets_view(int(parts[2]))
+    elif act == "mode":
+        gt["mode"] = "selected" if gt["mode"] == "all" else "all"
+        await save_group_targets(gt)
+        await q.answer()
+        text, markup = await group_targets_view(0)
+    elif act == "s":
+        key, page = f"{parts[2]}.{parts[3]}", int(parts[4])
+        if key in gt["groups"]:
+            del gt["groups"][key]
+            await save_group_targets(gt)
+            await q.answer()
+        elif key not in groups:
+            return await q.answer("Group not found. Rescan targets first.", show_alert=True)
+        elif limit is not None and len(gt["groups"]) >= limit:
+            return await q.answer(f"Your plan allows {limit} groups. Upgrade for more.", show_alert=True)
+        else:
+            gt["groups"][key] = {"title": groups[key][1], "accounts": None}
+            await save_group_targets(gt)
+            await q.answer()
+        text, markup = await group_targets_view(page)
+    elif act == "m":
+        await q.answer()
+        key, page = f"{parts[2]}.{parts[3]}", int(parts[4])
+        text, markup = await group_manage_view(key, page, gt, groups)
+    elif act == "a":
+        key, sid, page = f"{parts[2]}.{parts[3]}", parts[4], int(parts[5])
+        info = gt["groups"].get(key)
+        if info is None:
+            return await q.answer("Select this group first.", show_alert=True)
+        all_ids = {str(r["id"]) for r in await session_store.get_sessions(enabled_only=True)}
+        current = set(all_ids) if info["accounts"] is None else set(info["accounts"])
+        current ^= {sid}
+        info["accounts"] = None if current >= all_ids else sorted(current)
+        await save_group_targets(gt)
+        await q.answer()
+        text, markup = await group_manage_view(key, page, gt, groups)
+    else:
+        return await q.answer()
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            log.warning("target groups view failed: %s", exc)
+
+
+async def apply_target_rules(sid: str, groups: list, users: list):
+    """Limits one account's targets: DM switch, then selected groups and plan group cap."""
+    if (await db.get_setting("dm_broadcast_enabled", "1")) != "1":
+        users = []
+    gt = await load_group_targets()
+    if gt.get("mode") != "selected":
+        return groups, users
+    limit = (await plan_caps(tenant_id())).get("max_groups")
+    keys = list(gt["groups"].keys())
+    allowed_keys = set(keys if limit is None else keys[:limit])
+    out = []
+    for peer, name in groups:
+        key = group_key(peer)
+        if key not in allowed_keys:
+            continue
+        accounts = gt["groups"][key].get("accounts")
+        if accounts is not None and sid not in accounts:
+            continue
+        out.append((peer, name))
+    return out, users
+
+
 async def do_round(app: Application):
     all_sessions = await session_store.get_sessions(enabled_only=True)
     chosen = set(await promo_selected_ids([str(r["id"]) for r in all_sessions]))
@@ -2041,6 +2237,7 @@ async def do_round(app: Application):
                 return row, None, [], [], ("paused", remaining)
             client = await get_account_client(row)
             groups, users, _ = await get_cached_targets(row, client, force=False)
+            groups, users = await apply_target_rules(str(row["id"]), groups, users)
             return row, client, groups, users, None
         except errors.FloodWaitError as e:
             await pause_account(str(row["id"]), e.seconds + stats.group_delay_seconds,
@@ -2089,6 +2286,7 @@ async def do_round(app: Application):
             # while reconnecting. Persist it and let the scheduler recheck.
             client = await get_account_client(row)
             groups, users, _ = await get_cached_targets(row, client, force=False)
+            groups, users = await apply_target_rules(sid, groups, users)
         except errors.FloodWaitError as e:
             await pause_account(sid, e.seconds + stats.group_delay_seconds,
                                 f"Telegram FloodWait while resuming ({e.seconds}s)")
@@ -2795,7 +2993,9 @@ HELP_SECTIONS = [
      "📨 DM Broadcast: message your contacts.\n"
      "📅 Schedule: set timed runs.\n"
      "🌙 Quiet Hours: pause promotions in a daily window, e.g. 23:00-07:00.\n"
-     "🎯 Promo Accounts: choose which accounts send ads."),
+     "🎯 Promo Accounts: choose which accounts send ads.\n"
+     "🎯 Target Groups: send only to the groups you pick, and choose accounts per group.\n"
+     "🔘 DM Broadcast On/Off: turn direct messages on or off."),
     ("📝 Posts",
      "📝 Save Post: store a post to send.\n"
      "📋 List Posts and 👁 Preview Post: review saved posts.\n"
@@ -3132,7 +3332,7 @@ BOT_BUTTON_TEXTS = {"🤖 Bot Accounts", "👤 Bot Accounts", "➕ Add Bot", "�
 AI_BUTTON_TEXTS = {"🤖 AI Mode", "🔑 Groq API Key", "📚 AI Profile", "✅ I Accept These Rules"}
 LOCKED_TEXT = "🔒 This feature is not included in your current plan. Ask the admin to upgrade."
 _caps_cache: dict[int, tuple[float, dict]] = {}
-FULL_CAPS = {"max_accounts": None, "bot": True, "ai": True}
+FULL_CAPS = {"max_accounts": None, "max_groups": None, "bot": True, "ai": True}
 
 
 async def plan_caps(uid: int) -> dict:
@@ -4831,7 +5031,20 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PROMO_TASKS.pop(uid, None)
         await update.message.reply_text("⏹ Promotion stopped.", reply_markup=MENU)
 
+    elif text == "🔘 DM Broadcast On/Off":
+        now_on = (await db.get_setting("dm_broadcast_enabled", "1")) != "1"
+        await db.set_setting("dm_broadcast_enabled", "1" if now_on else "0")
+        await update.message.reply_text(
+            "🟢 DM broadcast is ON. Direct messages and the DM broadcast button are active."
+            if now_on else "🔴 DM broadcast is OFF. Direct messages and the DM broadcast button are paused.",
+            reply_markup=PROMOTION_MENU)
+    elif text == "🎯 Target Groups":
+        view, markup = await group_targets_view(0)
+        await update.message.reply_text(view, parse_mode=ParseMode.HTML, reply_markup=markup)
     elif text == "📨 DM Broadcast":
+        if (await db.get_setting("dm_broadcast_enabled", "1")) != "1":
+            await update.message.reply_text("🔴 DM broadcast is OFF. Turn it on with 🔘 DM Broadcast On/Off.", reply_markup=PROMOTION_MENU)
+            return
         if broadcast_running(context.application):
             await update.message.reply_text("🟢 Manual DM broadcast is already running.", reply_markup=MENU)
             return
@@ -5576,6 +5789,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(submenu_callback), pattern=r"^sm:[0-9a-f]{12}$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(admin_callback), pattern=r"^adm:(?:home|maint|users|back|acc|cleanpre|cleanok)$"))
     app.add_handler(CallbackQueryHandler(co_admin_callback, pattern=r"^coa:"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(group_targets_callback), pattern=r"^gt\."))
     app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji|front|fbio)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+)|frt:[er]|fbio:(?:t|tg|run))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))

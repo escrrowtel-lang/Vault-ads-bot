@@ -41,7 +41,16 @@ def B(label: str, data: str) -> InlineKeyboardButton:
 
 def _caps_text(caps) -> str:
     accts = "unlimited" if caps["max_accounts"] is None else str(caps["max_accounts"])
-    return f"{accts} account(s) · 🤖 Bot {'✅' if caps['bot'] else '❌'} · 🧠 AI {'✅' if caps['ai'] else '❌'}"
+    groups = caps.get("max_groups", 10)
+    return (f"{accts} account(s) · 📣 {groups} group(s) · 🤖 Bot {'✅' if caps['bot'] else '❌'} · "
+            f"🧠 AI {'✅' if caps['ai'] else '❌'}")
+
+
+DURATION_NAMES = {7: "7 Days", 15: "15 Days", 30: "1 Month", 60: "2 Months", 90: "3 Months"}
+
+
+def duration_label(days: int) -> str:
+    return DURATION_NAMES.get(int(days), f"{int(days)} Days")
 
 
 async def _edit(q, text, rows):
@@ -123,18 +132,34 @@ async def home_view(uid: int):
         return "💎 Subscriptions are temporarily unavailable. Please try again shortly.", [[B("⬅️ Back", "sub:back")]]
     plans = await S.run(S.STORE.list_plans, True)
     sub = await S.run(S.STORE.get_sub, uid)
-    lines = ["💎 <b>SUBSCRIPTION PLANS</b>", "", _sub_line(sub), ""]
+    lines = ["💎 <b>SUBSCRIPTION PLANS</b>", "", _sub_line(sub), "", "Choose a duration:"]
     rows = []
     if not plans:
         lines.append("No plans are available right now. Please contact the owner.")
-    for p in plans:
-        lines.append(f"• <b>{h(p['name'])}</b> — {S.fmt_inr(p['price_paise'])} for {p['duration_days']} days\n"
-                     f"   {_caps_text(S.caps_for_plan(p))}")
-        rows.append([B(f"{S.fmt_inr(p['price_paise'])} · {p['name']} · {p['duration_days']}d", f"sub:plan:{p['plan_id']}")])
+    for days in sorted({int(p["duration_days"]) for p in plans}):
+        group = [p for p in plans if int(p["duration_days"]) == days]
+        cheapest = min(p["price_paise"] for p in group)
+        rows.append([B(f"📅 {duration_label(days)} · from {S.fmt_inr(cheapest)}", f"sub:dur:{days}")])
     if not S.payments_configured():
         lines += ["", "⚠️ Online payments are not enabled yet."]
     rows.append([B("📊 My Subscription", "sub:my")])
     rows.append([B("⬅️ Back", "sub:back")])
+    return "\n".join(lines), rows
+
+
+async def duration_view(days: int):
+    plans = [p for p in await S.run(S.STORE.list_plans, True) if int(p["duration_days"]) == int(days)]
+    plans.sort(key=lambda p: (p.get("max_accounts") is None, p.get("max_accounts") or 0))
+    lines = [f"📅 <b>{duration_label(days)}</b>", "", "Choose how many accounts you need:", ""]
+    rows = []
+    for p in plans:
+        caps = S.caps_for_plan(p)
+        accts = "unlimited" if caps["max_accounts"] is None else caps["max_accounts"]
+        lines.append(f"• <b>{accts} accounts</b> — {S.fmt_inr(p['price_paise'])} · {caps['max_groups']} groups")
+        rows.append([B(f"👥 {accts} accounts · {S.fmt_inr(p['price_paise'])}", f"sub:plan:{p['plan_id']}")])
+    if not plans:
+        lines.append("No plans for this duration right now.")
+    rows.append([B("⬅️ Back", "sub:home")])
     return "\n".join(lines), rows
 
 
@@ -207,6 +232,9 @@ async def sub_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "my":
             await q.answer()
             return await _edit(q, *await my_view(user.id))
+        if action == "dur" and len(parts) == 3 and parts[2].isdigit():
+            await q.answer()
+            return await _edit(q, *await duration_view(int(parts[2])))
         if action == "plan" and len(parts) == 3:
             await q.answer()
             plan = await S.run(S.STORE.get_plan, parts[2])
@@ -416,24 +444,29 @@ async def dash_view(note=""):
 
 
 # (name, price in rupees, duration days, accounts). Prices are placeholders; admin edits them per plan.
-STARTER_PLANS = [
-    ("2 Din · 2 Accounts", 19, 2, 2),
-    ("7 Din · 2 Accounts", 49, 7, 2), ("7 Din · 5 Accounts", 99, 7, 5), ("7 Din · 10 Accounts", 179, 7, 10),
-    ("15 Din · 2 Accounts", 79, 15, 2), ("15 Din · 5 Accounts", 149, 15, 5), ("15 Din · 10 Accounts", 269, 15, 10),
-    ("30 Din · 2 Accounts", 129, 30, 2), ("30 Din · 5 Accounts", 249, 30, 5), ("30 Din · 10 Accounts", 449, 30, 10),
-]
+# (duration days, account tiers and prices in rupees). Admin can change every price afterwards.
+STARTER_GRID = {
+    7: [(2, 49), (5, 99), (10, 179), (15, 249)],
+    15: [(2, 79), (5, 149), (10, 269), (15, 369)],
+    30: [(2, 129), (5, 249), (10, 449), (15, 599)],
+    60: [(2, 229), (5, 449), (10, 799), (15, 1099)],
+    90: [(2, 329), (5, 649), (10, 1099), (15, 1499)],
+}
+STARTER_PLANS = [(f"{duration_label(d)} · {n} Accounts", price, d, n)
+                 for d, tiers in STARTER_GRID.items() for n, price in tiers]
 
 
 async def seed_starter_plans() -> tuple[int, int]:
     """Creates the starter plans. Plans with the same name are skipped, so it is safe to press twice."""
-    existing = {p["name"] for p in await S.run(S.STORE.list_plans)}
+    existing = {(int(p["duration_days"]), p.get("max_accounts")) for p in await S.run(S.STORE.list_plans)}
     made = skipped = 0
     for name, rupees, days, accounts in STARTER_PLANS:
-        if name in existing:
+        if (days, accounts) in existing:          # same duration and account tier already exists
             skipped += 1
             continue
         plan = await S.run(S.STORE.create_plan, name, rupees * 100, days)
-        await S.run(S.STORE.update_plan, plan["plan_id"], max_accounts=accounts, bot_feature=True, ai_feature=True)
+        await S.run(S.STORE.update_plan, plan["plan_id"], max_accounts=accounts, max_groups=10,
+                    bot_feature=True, ai_feature=True)
         made += 1
     return made, skipped
 
@@ -459,6 +492,7 @@ async def plan_view(pid, note=""):
     caps = S.caps_for_plan(p)
     text = (f"📦 <b>Plan #{p['plan_id']}: {h(p['name'])}</b>\n\nPrice: <b>{S.fmt_inr(p['price_paise'])}</b>\n"
             f"Duration: <b>{p['duration_days']} days</b>\nAccounts: <b>{'unlimited' if caps['max_accounts'] is None else caps['max_accounts']}</b>\n"
+            f"Target groups: <b>{caps['max_groups']}</b>\n"
             f"Bot feature: <b>{'ON' if caps['bot'] else 'OFF'}</b> · AI auto reply: <b>{'ON' if caps['ai'] else 'OFF'}</b>\n"
             f"Status: {'🟢 Enabled' if p['enabled'] else '🔴 Disabled'}\n\n"
             "Price/duration changes apply to new purchases only; payments already started keep their original amount.")
@@ -467,7 +501,7 @@ async def plan_view(pid, note=""):
     pid = p["plan_id"]
     rows = [[B("✏️ Name", f"sadm:pe:{pid}:name"), B("💰 Price", f"sadm:pe:{pid}:price")],
             [B("⏳ Duration", f"sadm:pe:{pid}:days"), B("🔴 Disable" if p["enabled"] else "🟢 Enable", f"sadm:pt:{pid}")],
-            [B("👥 Accounts", f"sadm:pe:{pid}:accounts")],
+            [B("👥 Accounts", f"sadm:pe:{pid}:accounts"), B("📣 Groups", f"sadm:pe:{pid}:groups")],
             [B(f"🤖 Bot: {'ON' if caps['bot'] else 'OFF'}", f"sadm:pf:{pid}:bot"),
              B(f"🧠 AI: {'ON' if caps['ai'] else 'OFF'}", f"sadm:pf:{pid}:ai")],
             [B("⬅️ Back", "sadm:plans")]]
@@ -675,7 +709,8 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
             field = parts[3]
             ask = {"name": "Send the new plan name:", "price": "Send the new price in rupees (e.g. 199):",
                    "days": "Send the new duration in days (e.g. 30):",
-                   "accounts": "Send how many Telegram accounts this plan allows (1–500):"}[field]
+                   "accounts": "Send how many Telegram accounts this plan allows (1–500):",
+                   "groups": "Send how many target groups this plan allows (1–1000):"}[field]
             return await _edit(q, *_prompt(ctx, "pedit_" + field, "✏️ " + ask, pid=parts[2]))
         if a == "pf":
             p = await S.run(S.STORE.get_plan, parts[2])
@@ -821,8 +856,9 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
         elif act.startswith("pedit_"):
             field = act[6:]
             val = {"name": S.parse_name, "price": S.parse_price_paise, "days": S.parse_days,
-                   "accounts": S.parse_accounts}[field](txt)
-            key = {"name": "name", "price": "price_paise", "days": "duration_days", "accounts": "max_accounts"}[field]
+                   "accounts": S.parse_accounts, "groups": S.parse_groups}[field](txt)
+            key = {"name": "name", "price": "price_paise", "days": "duration_days", "accounts": "max_accounts",
+                   "groups": "max_groups"}[field]
             await S.run(S.STORE.update_plan, st["pid"], **{key: val})
             ctx.user_data.pop("sadm", None)
             await S.run(S.STORE.audit, f"admin:{actor}", "plan_edit", st["pid"], {field: val})
