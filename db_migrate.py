@@ -122,6 +122,54 @@ def import_db(client, db_name, in_path, drop=False):
     return expected
 
 
+def to_sqlite(in_path, out_path):
+    """Convert a migration file into one SQLite file: a table per collection.
+
+    Each row holds the document's _id and its full JSON in one column, so no
+    data is lost. Index definitions go into the _indexes table.
+    """
+    import json
+    import sqlite3
+
+    header, docs, expected = _read_archive(in_path)
+    if os.path.exists(out_path):
+        raise SystemExit(f"{out_path} already exists. Choose another name or remove it first.")
+    con = sqlite3.connect(out_path)
+    try:
+        con.execute('CREATE TABLE "_indexes" (collection TEXT, name TEXT, keys TEXT, options TEXT)')
+        for item in header["collections"]:
+            con.execute(f'CREATE TABLE "{item["name"]}" (_id TEXT PRIMARY KEY, doc TEXT NOT NULL)')
+            for ix in item["indexes"]:
+                con.execute("INSERT INTO _indexes VALUES (?, ?, ?, ?)",
+                            (item["name"], ix["name"], json.dumps(ix["key"]), json.dumps(ix["options"])))
+        buffers = {}
+
+        def flush(name):
+            rows = buffers.pop(name, [])
+            if rows:
+                con.executemany(f'INSERT INTO "{name}" (_id, doc) VALUES (?, ?)', rows)
+
+        for line in docs:
+            name, doc = line["c"], line["d"]
+            key = json_util.dumps(doc.get("_id"))
+            buffers.setdefault(name, []).append((key, json_util.dumps(doc)))
+            if len(buffers[name]) >= BATCH:
+                flush(name)
+        for name in list(buffers):
+            flush(name)
+        con.commit()
+        problems = []
+        for name, want in expected.items():
+            got = con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+            if got != want:
+                problems.append(f"{name}: expected {want}, found {got}")
+        if problems:
+            raise SystemExit("SQLite count mismatch:\n  " + "\n  ".join(problems))
+    finally:
+        con.close()
+    return expected
+
+
 def check_dbs(src, dst, db_name):
     a, b = src[db_name], dst[db_name]
     names = sorted(set(a.list_collection_names()) | set(b.list_collection_names()))
@@ -160,6 +208,10 @@ def main(argv=None):
     c.add_argument("--dst-uri", default=os.getenv("DST_MONGO_URI"))
     c.add_argument("--db", default=os.getenv("MONGO_DB", "promo_bot"))
 
+    t = sub.add_parser("to-sqlite", help="convert a migration file into a SQLite file")
+    t.add_argument("--in", dest="infile", required=True)
+    t.add_argument("--out", required=True)
+
     args = p.parse_args(argv)
     if args.cmd == "export":
         if not args.src_uri:
@@ -175,6 +227,10 @@ def main(argv=None):
             raise SystemExit("Set --dst-uri or DST_MONGO_URI.")
         counts = import_db(_client(args.dst_uri), args.db, args.infile, drop=args.drop)
         print(f"Imported and verified {sum(counts.values())} documents in {len(counts)} collections.")
+        return 0
+    if args.cmd == "to-sqlite":
+        counts = to_sqlite(args.infile, args.out)
+        print(f"Wrote {sum(counts.values())} documents in {len(counts)} tables to {args.out}")
         return 0
     if args.cmd == "check":
         if not (args.src_uri and args.dst_uri):
