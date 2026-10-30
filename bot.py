@@ -4578,7 +4578,10 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await client.connect()
             sent = await client.send_code_request(phone)
-            login_flows[uid] = {"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash}
+            log.info("login code requested uid=%s type=%s timeout=%s", uid,
+                     type(getattr(sent, "type", None)).__name__, getattr(sent, "timeout", None))
+            login_flows[uid] = {"client": client, "phone": phone, "phone_code_hash": sent.phone_code_hash,
+                                "sent_at": time.time()}
             state[uid] = "await_otp"
             await context.bot.send_message(
                 uid,
@@ -4617,7 +4620,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except errors.PhoneCodeExpiredError:
             # Telegram invalidates a code once a newer one is requested, so ask for a fresh one
             # on the same connection instead of making the user restart the whole flow.
-            log.warning("OTP rejected as expired for uid=%s; requesting a fresh code", uid)
+            log.warning("OTP rejected as expired for uid=%s after %.0fs; requesting a fresh code",
+                        uid, time.time() - flow.get("sent_at", time.time()))
             try:
                 sent = await client.send_code_request(flow["phone"])
                 flow["phone_code_hash"] = sent.phone_code_hash
