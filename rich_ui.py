@@ -24,7 +24,8 @@ def rich_cell(text, header=False, align="left"):
 
 def button_cell(label, callback_data, style="primary", align="center"):
     """A table cell holding one button that sends callback_data when tapped."""
-    return {"text": [{"type": "button", "text": label, "callback_data": callback_data, "style": style}],
+    # Per Bot API: a RichTextButton element wraps a RichMessageButton under "button".
+    return {"text": [{"type": "button", "button": {"text": label, "callback_data": callback_data, "style": style}}],
             "is_header": False, "colspan": 1, "rowspan": 1, "align": align, "valign": "middle"}
 
 
