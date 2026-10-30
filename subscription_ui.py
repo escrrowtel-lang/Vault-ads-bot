@@ -355,8 +355,8 @@ async def _record_user(uid, first_name):
     try:
         if await S.run(S.STORE.touch_user, uid, first_name):
             await S.log_event(f"👋 New user · {h(first_name or '-')} · <code>{uid}</code>")
-    except Exception:
-        log.warning("could not register bot user")
+    except Exception as exc:
+        log.warning("could not register bot user: %s: %s", type(exc).__name__, exc)
 
 
 async def start_gate(update, ctx: ContextTypes.DEFAULT_TYPE):
