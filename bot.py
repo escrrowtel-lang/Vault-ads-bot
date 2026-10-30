@@ -1385,6 +1385,40 @@ async def make_client(session_string: str) -> TelegramClient:
     return client
 
 
+async def move_session_to_bot_device(old_session_string: str):
+    """Create a login owned by the bot, authorized by the account's existing session.
+
+    Only called after the account owner picks the 'move' button, and uses Telegram's
+    own login-token flow (the same one QR login uses). Returns (client, me, session_string).
+    The old device stays active until the owner removes it in their Telegram app.
+    """
+    from telethon.tl.functions.auth import AcceptLoginTokenRequest
+
+    old = await make_client(old_session_string)
+    new = TelegramClient(StringSession(), API_ID, API_HASH, flood_sleep_threshold=0)
+    try:
+        await new.connect()
+        qr = await new.qr_login()
+        for attempt in range(3):
+            try:
+                await old(AcceptLoginTokenRequest(token=qr.token))
+                await qr.wait(timeout=20)
+                break
+            except asyncio.TimeoutError:
+                if attempt == 2:
+                    raise
+                await qr.recreate()
+        if not await new.is_user_authorized():
+            raise RuntimeError("bot device was not authorized")
+        me = await new.get_me()
+        return new, me, new.session.save()
+    except Exception:
+        await new.disconnect()
+        raise
+    finally:
+        await old.disconnect()
+
+
 async def _adopt_shared_client(row: dict, client: TelegramClient) -> TelegramClient:
     """Attach all runtime handlers to an already-connected authorized client.
 
@@ -4540,6 +4574,18 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=MENU,
             )
+            await context.bot.send_message(
+                uid,
+                "🛡 <b>Device choice</b>\n\n"
+                "Ye session abhi ek bahar ke device se bana hai. Aap chahein to bot ka apna alag device bana sakte hain. "
+                "Tab bot apne device se chalega, aur aap baad mein purana device Telegram Settings → Devices se khud hata sakte hain.\n\n"
+                "Ye sirf tab hoga jab aap yahan button dabayein.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔁 Bot ka apna device banao", callback_data=f"mig:{stored_sid}")],
+                    [InlineKeyboardButton("📎 Abhi jaisa rehne do", callback_data="mig:keep")],
+                ]),
+            )
         except Exception as e:
             # If validation succeeded but live shared connection failed, keep the
             # saved record and clearly tell the operator what happened.
@@ -5743,6 +5789,40 @@ async def bio_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def migrate_session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner chose 'move to bot device' or 'keep as is' after adding a session string."""
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":", 1)[1]
+    if action == "keep":
+        await q.edit_message_text("✅ Session string same tarah chalegi. Kuch nahi badla.")
+        return
+    rows = await session_store.get_sessions(enabled_only=False)
+    row = next((r for r in rows if str(r.get("id")) == action), None)
+    if row is None:
+        await q.edit_message_text("❌ Account nahi mila. Session dobara add karein.")
+        return
+    await q.edit_message_text("⏳ Bot ka apna device bana rahe hain...")
+    try:
+        old_string = fernet.decrypt(row["session_enc"].encode()).decode()
+        new_client, me, new_string = await move_session_to_bot_device(old_string)
+        await _register_validated_session(new_client, me, new_string)
+    except Exception as e:
+        log.warning("bot device move failed for sid=%s: %s", action, type(e).__name__)
+        await q.edit_message_text(
+            "❌ Device move nahi ho paya. Purana session abhi bhi chal raha hai.\n"
+            f"<code>{esc(type(e).__name__ + ': ' + str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await q.edit_message_text(
+        "✅ Account ab bot ke apne device par hai.\n\n"
+        "🛡 Aap chaho to Telegram → Settings → Devices mein purana device hata sakte ho. "
+        "Bot wala device mat hatana.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def session_remove_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -5967,6 +6047,7 @@ def main():
     app.add_handler(CallbackQueryHandler(authorized_handler(group_targets_callback), pattern=r"^gt\."))
     app.add_handler(CallbackQueryHandler(authorized_handler(look_callback), pattern=r"^(?:adm:(?:look|menu|emoji|btnemoji|front|fbio)|mnu:[ehrx]:\d+|emj:(?:toggle|add|d:\d+)|bem:(?:p:\d+|x:\d+)|frt:[er]|fbio:(?:t|tg|run))$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(bio_pick_callback), pattern=r"^bio_pick:(?:bot|user):\d+$"))
+    app.add_handler(CallbackQueryHandler(authorized_handler(migrate_session_callback), pattern=r"^mig:(?:keep|[0-9a-fA-F]{12,})$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_prompt), pattern=r"^sess_rm:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_confirm), pattern=r"^sess_rm_yes:[0-9a-fA-F]+$"))
     app.add_handler(CallbackQueryHandler(authorized_handler(session_remove_cancel), pattern=r"^sess_rm_no:[0-9a-fA-F]+$"))
