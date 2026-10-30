@@ -3909,7 +3909,7 @@ async def look_text_input(update: Update, uid: int, current: str, text: str):
 # ---- AI reply mode (Groq). Each owner brings their own Groq key; it is stored encrypted.
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")  # llama-3.1-8b-instant was shut down by Groq on 2026-08-16
 AI_POLICY_TEXT = (
     "⚠️ <b>AI MODE — RULES</b>\n\n"
     "AI jawab aapke account se bhejega. Aage badhne se pehle ye rules maanna zaroori hai:\n\n"
@@ -3988,7 +3988,8 @@ async def ai_reply_for(session_key: str, event):
         reply = (await groq_chat(api_key, ai_system_prompt(profile), list(hist))).strip()[:500]
     except Exception as e:
         hist.pop()
-        log.warning("Groq reply failed: %s", type(e).__name__)
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        log.warning("Groq reply failed: %s status=%s", type(e).__name__, status)
         return None
     if not reply:
         hist.pop()

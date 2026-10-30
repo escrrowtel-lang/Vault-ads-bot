@@ -691,13 +691,19 @@ def _prompt(ctx, act, text, back="sadm:home", **extra):
 
 async def logch_view(note=""):
     cur = (await S.run(S.STORE.get_setting, "log_channel")) if S.STORE else ""
+    pay = (await S.run(S.STORE.get_setting, "payment_channel")) if S.STORE else ""
     lines = ["📜 <b>LOG CHANNEL</b>", "",
              "Bot events are posted here: new users, accounts added or removed, operators added or removed, "
-             "payments, subscriptions, trials and expiries.", "",
+             "trials, subscriptions and expiries.", "",
              f"Channel: <b>{h(cur) if cur else 'not set'}</b>", "",
-             "Add this bot as an admin in the channel first (permission to post)."]
+             "💳 <b>PAYMENT CHANNEL</b>", "",
+             "Payment started and payment verified events go here. If not set, they go to the log channel.", "",
+             f"Payment channel: <b>{h(pay) if pay else 'not set (uses log channel)'}</b>", "",
+             "Add this bot as an admin in each channel first (permission to post)."]
     rows = [[B("✏️ Set channel", "sadm:logset")], [B("🧪 Send test", "sadm:logtest")],
-            [B("🗑 Remove channel", "sadm:logclr")], [B("⬅️ Back", "sadm:home")]]
+            [B("🗑 Remove channel", "sadm:logclr")],
+            [B("💳 Set payment channel", "sadm:paylog")], [B("🧪 Test payment channel", "sadm:paylogtest")],
+            [B("🗑 Remove payment channel", "sadm:paylogclr")], [B("⬅️ Back", "sadm:home")]]
     return (note + "\n\n" if note else "") + "\n".join(lines), rows
 
 
@@ -747,6 +753,16 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if a == "logclr":
             await S.set_log_channel("")
             return await _edit(q, *await logch_view("🗑 Log channel removed."))
+        if a == "paylog":
+            return await _edit(q, *_prompt(ctx, "paylog", "💳 Send the <b>payment</b> channel ID (like -1001234567890) "
+                                           "or the @channel username.", back="sadm:logch"))
+        if a == "paylogclr":
+            await S.set_payment_channel("")
+            return await _edit(q, *await logch_view("🗑 Payment channel removed. Payments go to the log channel now."))
+        if a == "paylogtest":
+            ok = await S.payment_log("🧪 Test message: the payment channel is working.")
+            return await _edit(q, *await logch_view("✅ Test sent." if ok else
+                                                   "❌ Could not post. Check the channel ID and that the bot is an admin there."))
         if a == "logtest":
             ok = await S.log_event("🧪 Test message: the log channel is working.")
             return await _edit(q, *await logch_view("✅ Test sent." if ok else
@@ -913,6 +929,16 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop("sadm", None)
             await S.run(S.STORE.audit, f"admin:{actor}", "plan_edit", st["pid"], {field: val})
             text, rows = await plan_view(st["pid"], "✅ Plan updated.")
+        elif act == "paylog":
+            chat = txt.strip()
+            if not chat or len(chat) > 64 or " " in chat:
+                raise ValueError("Send a channel ID like -1001234567890 or @channelname.")
+            await S.set_payment_channel(chat)
+            if not await S.payment_log("✅ Payment channel connected. Payment events will be posted here."):
+                await S.set_payment_channel("")
+                raise ValueError("Could not post to that channel. Add this bot as an admin there and send the ID again.")
+            ctx.user_data.pop("sadm", None)
+            text, rows = await logch_view("✅ Payment channel saved.")
         elif act == "logch":
             chat = txt.strip()
             if not chat or len(chat) > 64 or " " in chat:

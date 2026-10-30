@@ -563,6 +563,35 @@ async def log_event(text: str) -> bool:
         return False
 
 
+_PAY_CACHE = {"at": 0.0, "chat": ""}
+
+
+async def set_payment_channel(value: str) -> None:
+    """Admin sets the payment channel ('' clears it, so payments go to the log channel)."""
+    await run(STORE.set_setting, "payment_channel", value)
+    _PAY_CACHE.update(at=time.monotonic(), chat=value)
+
+
+async def payment_log(text: str) -> bool:
+    """Posts payment events to the payment channel. Falls back to the log channel when none is set."""
+    try:
+        bot = LOG_BOT["bot"]
+        if not STORE or bot is None:
+            return False
+        if time.monotonic() - _PAY_CACHE["at"] > 60:
+            _PAY_CACHE["chat"] = await run(STORE.get_setting, "payment_channel")
+            _PAY_CACHE["at"] = time.monotonic()
+        chat = (_PAY_CACHE["chat"] or "").strip()
+        if not chat:
+            return await log_event(text)
+        chat_id = int(chat) if chat.lstrip("-").isdigit() else chat
+        await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        log.warning("payment channel post failed: %s", type(e).__name__)
+        return False
+
+
 async def _notify(uid, text):
     try:
         if HOOKS.get("notify"):
@@ -624,7 +653,7 @@ async def create_checkout(user_id: int, plan_id: str):
             log.warning("payment link creation failed for user %s: %s", user_id, e)
             raise RuntimeError("Could not start the payment. Please try again in a moment.")
         await run(STORE.audit, f"user:{user_id}", "payment_created", ref, {"plan": plan["plan_id"], "amount_paise": doc["amount_paise"]})
-        await log_event(f"💳 Payment started · user <code>{user_id}</code> · {_h(plan['name'])} · {fmt_inr(doc['amount_paise'])}")
+        await payment_log(f"💳 Payment started · user <code>{user_id}</code> · {_h(plan['name'])} · {fmt_inr(doc['amount_paise'])}")
         return updated, False
 
 
@@ -692,7 +721,7 @@ async def activate(ref: str) -> bool:
         await run(STORE.release_fulfillment, ref, e)
         return False
     if applied:
-        await log_event(f"✅ Subscription activated · user <code>{uid}</code> · {_h(doc['plan_name'])} · "
+        await payment_log(f"✅ Subscription activated · user <code>{uid}</code> · {_h(doc['plan_name'])} · "
                         f"{fmt_inr(doc['amount_paise'])} · until {fmt_dt(sub['expires_at'])}")
         await _notify(uid, "✅ <b>Payment verified!</b>\n\n"
                            f"Plan: <b>{_h(doc['plan_name'])}</b>\nAmount: {fmt_inr(doc['amount_paise'])}\n"
