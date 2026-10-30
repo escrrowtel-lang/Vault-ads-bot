@@ -369,6 +369,9 @@ class _ReplyCountProxy:
         self._data()[key] = value
 _reply_sent_counts = _ReplyCountProxy()
 _bot_reply_timestamps: dict[int, float] = {}
+# The canned (non-AI) DM text goes to each person at most once per this window.
+DM_CANNED_ONCE_SECONDS = 24 * 3600
+_canned_dm_sent: dict[tuple, float] = {}
 
 scan_locks: dict[str, asyncio.Lock] = {}
 # New groups seen before an account's first scan are merged into that scan.
@@ -925,6 +928,11 @@ async def _bot_account_listener(app: Application, owner_uid: int, bot_id: int):
                                 await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
                                 await db.record_bot_event(bot_id, "skipped", scope, chat.id, usr.id, "Auto Reply text is empty")
                                 continue
+                            dm_key = ("managed_bot", bot_id, int(usr.id))
+                            if time.monotonic() - _canned_dm_sent.get(dm_key, -1e20) < DM_CANNED_ONCE_SECONDS:
+                                await db.release_bot_reply_slot(bot_id, chat.id, usr.id)
+                                continue
+                            _canned_dm_sent[dm_key] = time.monotonic()
                             await api_bot.send_message(
                                 chat_id=chat.id,
                                 text=dm_text,
@@ -2806,11 +2814,16 @@ async def bot_dm_auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if now - _bot_reply_timestamps.get(uid, -1e20) < await reply_cooldown():
         return
+    # The canned text goes to each person once per window, not on every message.
+    ckey = ("control_bot", uid)
+    if now - _canned_dm_sent.get(ckey, -1e20) < DM_CANNED_ONCE_SECONDS:
+        return
     # Prevent duplicate replies to consecutive incoming media/text messages.
     _bot_reply_timestamps[uid] = now
     try:
         message = await reply_setting("control_bot_dm_text", DM_AUTO_REPLY_TEXT)
         await update.message.reply_text(message, disable_web_page_preview=True)
+        _canned_dm_sent[ckey] = time.monotonic()
         _reply_sent_counts["control_bot"] += 1
     except Exception as e:
         _reply_sent_counts["failed"] += 1
@@ -2850,6 +2863,12 @@ def account_reply_handler(session_key: str):
                     _account_reply_timestamps[key] = time.monotonic()
                     _reply_sent_counts["accounts"] += 1
                     return
+                # AI mode is on: the canned text is never used, even when AI has no answer.
+                log.info("AI reply skipped for %s; no canned fallback while AI mode is on", key[1])
+                return
+            # Canned text (saved post or default text) goes to each person once per window.
+            if time.monotonic() - _canned_dm_sent.get(key, -1e20) < DM_CANNED_ONCE_SECONDS:
+                return
             if await reply_enabled("dm_use_saved_post", DM_AUTO_REPLY_USE_SAVED_POST):
                 mode = await db.get_setting("post_mode", "rotate")
                 post = await db.next_reply_post(mode)
@@ -2860,6 +2879,7 @@ def account_reply_handler(session_key: str):
                         priority=True,
                     )
                     _account_reply_timestamps[key] = time.monotonic()
+                    _canned_dm_sent[key] = time.monotonic()
                     _reply_sent_counts["accounts"] += 1
                     return
             message = await reply_setting("account_dm_text", ACCOUNT_DM_AUTO_REPLY_TEXT)
@@ -2870,6 +2890,7 @@ def account_reply_handler(session_key: str):
             )
             # A failed/delayed reply must not start a 5-minute cooldown.
             _account_reply_timestamps[key] = time.monotonic()
+            _canned_dm_sent[key] = time.monotonic()
             _reply_sent_counts["accounts"] += 1
         except AccountPausedError:
             # Pause may begin while this reply waits behind a group message.
