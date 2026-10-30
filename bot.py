@@ -4614,13 +4614,21 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except errors.SessionPasswordNeededError:
             state[uid] = "await_2fa"
             await context.bot.send_message(uid, "🔐 Two-step verification is enabled. Send your Telegram 2FA password.", reply_markup=ADD_SESSION_MENU)
-        except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as e:
-            if isinstance(e, errors.PhoneCodeExpiredError):
+        except errors.PhoneCodeExpiredError:
+            # Telegram invalidates a code once a newer one is requested, so ask for a fresh one
+            # on the same connection instead of making the user restart the whole flow.
+            log.warning("OTP rejected as expired for uid=%s; requesting a fresh code", uid)
+            try:
+                sent = await client.send_code_request(flow["phone"])
+                flow["phone_code_hash"] = sent.phone_code_hash
+                await context.bot.send_message(uid, "⏳ That code had expired. Telegram sent a new login code. Send the new OTP here.", reply_markup=ADD_SESSION_MENU)
+            except Exception as resend_exc:
+                log.warning("fresh OTP request failed for uid=%s: %s", uid, type(resend_exc).__name__)
                 state.pop(uid, None)
                 await cleanup_login_flow(uid)
-                await context.bot.send_message(uid, "❌ OTP expired. Start Add Session again to request a new code.", reply_markup=MENU)
-            else:
-                await context.bot.send_message(uid, "❌ Wrong OTP. Try again or press ⬅️ Back.", reply_markup=ADD_SESSION_MENU)
+                await context.bot.send_message(uid, "❌ OTP expired and a new code could not be sent. Start Add Session again.", reply_markup=MENU)
+        except errors.PhoneCodeInvalidError:
+            await context.bot.send_message(uid, "❌ Wrong OTP. Try again or press ⬅️ Back.", reply_markup=ADD_SESSION_MENU)
         except Exception as e:
             state.pop(uid, None)
             await cleanup_login_flow(uid)
