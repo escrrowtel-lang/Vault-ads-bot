@@ -372,6 +372,8 @@ _bot_reply_timestamps: dict[int, float] = {}
 # The canned (non-AI) DM text goes to each person at most once per this window.
 DM_CANNED_ONCE_SECONDS = 24 * 3600
 _canned_dm_sent: dict[tuple, float] = {}
+# Minimum gap between two AI replies to the same person (anti-duplicate, not a conversation limit).
+AI_REPLY_COOLDOWN_SECONDS = 8
 
 scan_locks: dict[str, asyncio.Lock] = {}
 # New groups seen before an account's first scan are merged into that scan.
@@ -2845,7 +2847,10 @@ def account_reply_handler(session_key: str):
         now = time.monotonic()
         if key in _account_reply_pending:
             return
-        if now - _account_reply_timestamps.get(key, -1e20) < await reply_cooldown():
+        # AI mode answers each message in a conversation; the long cooldown only limits canned replies.
+        ai_on = await reply_enabled("ai_reply_enabled", False)
+        wait = AI_REPLY_COOLDOWN_SECONDS if ai_on else await reply_cooldown()
+        if now - _account_reply_timestamps.get(key, -1e20) < wait:
             return
         if await get_pause_remaining(session_key):
             # A Telegram FloodWait/PeerFlood applies to replies as well.
@@ -3988,10 +3993,14 @@ async def groq_key_valid(api_key: str) -> bool:
 async def ai_reply_for(session_key: str, event):
     """Returns the AI reply text, or None to fall back to the normal auto-reply."""
     if not (await plan_caps(tenant_id()))["ai"]:
+        log.info("AI reply skipped: current plan has no AI feature (operator %s)", tenant_id())
         return None
     enc = await db.get_setting("ai_groq_key", None)
     profile = ((await db.get_setting("ai_profile", "")) or "").strip()
-    if not enc or not profile or not await db.get_setting("ai_policy_accepted_at", None):
+    accepted = await db.get_setting("ai_policy_accepted_at", None)
+    if not enc or not profile or not accepted:
+        log.info("AI reply skipped: setup incomplete (key=%s profile=%s rules=%s, operator %s)",
+                 bool(enc), bool(profile), bool(accepted), tenant_id())
         return None
     incoming = (getattr(event, "raw_text", "") or "").strip()
     if not incoming:
