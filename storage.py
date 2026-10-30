@@ -337,6 +337,8 @@ class _Engine:
                          "(collection TEXT, k TEXT, op TEXT, doc TEXT, PRIMARY KEY (collection, k))")
         self.tables = set(r[0] for r in self.con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"))
+        # Decoded documents per collection, loaded on first use and kept in step with every write.
+        self.cache = {}
 
     def table(self, name):
         with self.lock:
@@ -345,17 +347,35 @@ class _Engine:
                                  "(_id TEXT PRIMARY KEY, doc TEXT NOT NULL)")
                 self.tables.add(name)
 
-    def all_docs(self, name):
-        with self.lock:
+    def _load(self, name):
+        """Decoded docs of one collection in insertion order. Caller must hold the lock."""
+        if name not in self.cache:
             self.table(name)
             rows = self.con.execute(f'SELECT _id, doc FROM "{name}" ORDER BY rowid').fetchall()
-        return [(k, _dec(doc)) for k, doc in rows]
+            self.cache[name] = {k: _dec(doc) for k, doc in rows}
+        return self.cache[name]
+
+    def all_docs(self, name):
+        """(key, doc) pairs. The docs are the cached objects: read them, never mutate them."""
+        with self.lock:
+            return list(self._load(name).items())
+
+    def lookup(self, name, k):
+        with self.lock:
+            return self._load(name).get(k)
 
     def put(self, name, k, doc, insert_only=False):
         with self.lock:
             self.table(name)
+            cache = self.cache.get(name)
+            if insert_only and cache is not None and k in cache:
+                return
+            text = _enc(doc)
             verb = "INSERT OR IGNORE" if insert_only else "INSERT OR REPLACE"
-            self.con.execute(f'{verb} INTO "{name}" (_id, doc) VALUES (?, ?)', (k, _enc(doc)))
+            self.con.execute(f'{verb} INTO "{name}" (_id, doc) VALUES (?, ?)', (k, text))
+            if cache is not None:
+                cache.pop(k, None)          # re-insert so the order matches SQLite's rowid order
+                cache[k] = _dec(text)
 
     def get(self, name, k):
         with self.lock:
@@ -367,6 +387,9 @@ class _Engine:
         with self.lock:
             self.table(name)
             cur = self.con.execute(f'DELETE FROM "{name}" WHERE _id = ?', (k,))
+            cache = self.cache.get(name)
+            if cache is not None:
+                cache.pop(k, None)
             return cur.rowcount
 
     def collection_names(self):
@@ -582,12 +605,18 @@ class Collection:
                     raise DuplicateKeyError(f"duplicate key on {self.name} index {ix['name']}")
 
     def _find_first(self, flt, sort=None):
-        """All (key, doc) pairs matching flt, in sort order (natural order if no sort)."""
-        docs = [(k, d) for k, d in self._docs() if match(d, flt or {})]
+        """All (key, doc) pairs matching flt, in sort order (natural order if no sort). Docs are copies."""
+        flt = flt or {}
+        if set(flt) == {"_id"} and not isinstance(flt["_id"], (dict, list)):
+            k = _key_of(flt["_id"])
+            hit = self._engine.lookup(self.name, k)
+            docs = [(k, hit)] if hit is not None else []
+        else:
+            docs = [(k, d) for k, d in self._docs() if match(d, flt)]
         for key, direction in reversed(_normalize_sort(sort)):
             docs.sort(key=lambda kd, key=key: _sort_key(_get(kd[1], key)),
                       reverse=(direction == DESCENDING))
-        return docs
+        return [(k, copy.deepcopy(d)) for k, d in docs]
 
     # --- reads ---
     def find(self, flt=None, projection=None):
@@ -617,7 +646,7 @@ class Collection:
                 docs = self._group(docs, arg)
             else:
                 raise ValueError(f"unsupported aggregation stage {name}")
-        return docs
+        return copy.deepcopy(docs)
 
     def _group(self, docs, spec):
         id_expr = spec["_id"]
