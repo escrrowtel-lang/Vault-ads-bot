@@ -276,6 +276,18 @@ class Store:
     def del_setting(self, key):
         self.settings.delete_one({"_id": f"{self.owner_id}:{key}"})
 
+    # ---- per-operator limit overrides: {"max_accounts": int|None, "max_groups": int|None}
+    # A key that is absent means "use the plan"; a None value means unlimited.
+    def get_cap_override(self, uid):
+        raw = self.get_setting(f"cap_override:{uid}")
+        return json.loads(raw) if raw else {}
+
+    def set_cap_override(self, uid, data):
+        if data:
+            self.set_setting(f"cap_override:{uid}", json.dumps(data))
+        else:
+            self.del_setting(f"cap_override:{uid}")
+
     def has_sub_record(self, uid):
         return self.subs.find_one({"_id": self.sid(uid)}, {"_id": 1}) is not None
 
@@ -502,6 +514,19 @@ def user_lock(uid: int) -> asyncio.Lock:
 
 async def run(fn, *a, **k):
     return await asyncio.to_thread(lambda: fn(*a, **k))
+
+
+# Bumped on every override change so cached plan limits are refreshed at once.
+CAP_VERSION = {"v": 0}
+
+
+async def get_cap_override(uid: int) -> dict:
+    return await run(STORE.get_cap_override, uid)
+
+
+async def set_cap_override(uid: int, data: dict) -> None:
+    await run(STORE.set_cap_override, uid, data)
+    CAP_VERSION["v"] += 1
 
 
 async def init(uri, db_name, owner_id, loop, hooks):

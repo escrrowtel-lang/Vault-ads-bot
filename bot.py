@@ -3544,7 +3544,7 @@ BOT_BUTTON_TEXTS = {"🤖 Bot Accounts", "👤 Bot Accounts", "➕ Add Bot", "�
                     "🟢 Toggle Bot Auto Reply", "🟢 Toggle Group Reply", "⏱ Bot Reply Cooldown", "🗑 Remove Bot"}
 AI_BUTTON_TEXTS = {"🤖 AI Mode", "🔑 Groq API Key", "📚 AI Profile", "✅ I Accept These Rules"}
 LOCKED_TEXT = "🔒 This feature is not included in your current plan. Ask the admin to upgrade."
-_caps_cache: dict[int, tuple[float, dict]] = {}
+_caps_cache: dict[int, tuple[float, dict, int]] = {}
 FULL_CAPS = {"max_accounts": None, "max_groups": None, "bot": True, "ai": True}
 
 
@@ -3552,7 +3552,7 @@ async def plan_caps(uid: int) -> dict:
     if uid == ADMIN_ID or subs_core.STORE is None:
         return dict(FULL_CAPS)
     hit = _caps_cache.get(uid)
-    if hit and time.time() - hit[0] < 300:
+    if hit and time.time() - hit[0] < 300 and hit[2] == subs_core.CAP_VERSION["v"]:
         return hit[1]
     try:
         sub = await subs_core.run(subs_core.STORE.get_sub, uid)
@@ -3565,10 +3565,15 @@ async def plan_caps(uid: int) -> dict:
         else:
             plan = await subs_core.run(subs_core.STORE.get_plan, sub.get("plan_id"))
             caps = subs_core.caps_for_plan(plan) if plan else dict(subs_core.TRIAL_CAPS)
+        # Admin override from the panel wins over the plan; a None value means unlimited.
+        override = await subs_core.get_cap_override(uid)
+        for field in ("max_accounts", "max_groups"):
+            if field in override:
+                caps[field] = override[field]
     except Exception:
         log.exception("plan caps lookup failed for %s", uid)
         return dict(subs_core.TRIAL_CAPS)
-    _caps_cache[uid] = (time.time(), caps)
+    _caps_cache[uid] = (time.time(), caps, subs_core.CAP_VERSION["v"])
     return caps
 
 

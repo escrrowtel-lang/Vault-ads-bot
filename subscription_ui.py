@@ -487,7 +487,7 @@ async def dash_view(note=""):
             [B("📜 Log Channel", "sadm:logch"), B("🆘 Support", "sadm:sup")],
             [B("🙋 Approved Users", "sadm:users"), B("📣 Broadcast", "sadm:bc")],
             [B("👋 Welcome Msg", "sadm:wm"), B("🧾 Audit Log", "sadm:audit:0")],
-            [B("🎁 Toggle free trial", "sadm:trial")],
+            [B("🎁 Toggle free trial", "sadm:trial"), B("🎚 User Limits", "sadm:ulim")],
             [B("🔄 Verify pending now", "sadm:sync")],
             [B("⬅️ Back", "adm:home")]]
     return "\n".join(lines), rows
@@ -689,6 +689,26 @@ def _prompt(ctx, act, text, back="sadm:home", **extra):
     return text, [[B("❌ Cancel", "sadm:cancel")]]
 
 
+async def ulim_view(uid: int, note: str = ""):
+    ov = await S.get_cap_override(uid)
+
+    def shown(field):
+        if field not in ov:
+            return "plan default"
+        return "unlimited" if ov[field] is None else str(ov[field])
+
+    lines = ["🎚 <b>USER LIMITS</b>", "",
+             f"Operator ID: <code>{uid}</code>", "",
+             f"Accounts: <b>{shown('max_accounts')}</b>",
+             f"Groups: <b>{shown('max_groups')}</b>", "",
+             "Anything set to 'plan default' follows the operator's plan. Changes apply right away."]
+    rows = [[B("♾ Unlimited accounts", f"sadm:ulimset:{uid}:acc:unl"), B("🔢 Set accounts", f"sadm:ulimnum:{uid}:acc")],
+            [B("♾ Unlimited groups", f"sadm:ulimset:{uid}:grp:unl"), B("🔢 Set groups", f"sadm:ulimnum:{uid}:grp")],
+            [B("↩️ Reset accounts", f"sadm:ulimset:{uid}:acc:reset"), B("↩️ Reset groups", f"sadm:ulimset:{uid}:grp:reset")],
+            [B("⬅️ Back", "sadm:home")]]
+    return (note + "\n\n" if note else "") + "\n".join(lines), rows
+
+
 async def logch_view(note=""):
     cur = (await S.run(S.STORE.get_setting, "log_channel")) if S.STORE else ""
     pay = (await S.run(S.STORE.get_setting, "payment_channel")) if S.STORE else ""
@@ -753,6 +773,22 @@ async def sadm_callback(update, ctx: ContextTypes.DEFAULT_TYPE):
         if a == "logclr":
             await S.set_log_channel("")
             return await _edit(q, *await logch_view("🗑 Log channel removed."))
+        if a == "ulim":
+            return await _edit(q, *_prompt(ctx, "ulim_id", "🎚 <b>User limits</b>\n\n"
+                                           "Send the operator's Telegram user ID (numbers only).", back="sadm:home"))
+        if a == "ulimset":                     # sadm:ulimset:<uid>:<acc|grp>:<unl|reset>
+            uid, field, mode = int(parts[2]), parts[3], parts[4]
+            key = "max_accounts" if field == "acc" else "max_groups"
+            ov = await S.get_cap_override(uid)
+            if mode == "unl":
+                ov[key] = None
+            else:
+                ov.pop(key, None)
+            await S.set_cap_override(uid, ov)
+            return await _edit(q, *await ulim_view(uid, "✅ Saved."))
+        if a == "ulimnum":                     # sadm:ulimnum:<uid>:<acc|grp>
+            return await _edit(q, *_prompt(ctx, "ulim_num", "🔢 Send the number (1 to 999) for this limit.",
+                                           uid=int(parts[2]), field=parts[3]))
         if a == "paylog":
             return await _edit(q, *_prompt(ctx, "paylog", "💳 Send the <b>payment</b> channel ID (like -1001234567890) "
                                            "or the @channel username.", back="sadm:logch"))
@@ -929,6 +965,22 @@ async def sadm_text(update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data.pop("sadm", None)
             await S.run(S.STORE.audit, f"admin:{actor}", "plan_edit", st["pid"], {field: val})
             text, rows = await plan_view(st["pid"], "✅ Plan updated.")
+        elif act == "ulim_id":
+            raw = txt.strip()
+            if not raw.isdigit():
+                raise ValueError("Send the operator's numeric Telegram user ID.")
+            ctx.user_data.pop("sadm", None)
+            text, rows = await ulim_view(int(raw))
+        elif act == "ulim_num":
+            raw = txt.strip()
+            if not raw.isdigit() or not 1 <= int(raw) <= 999:
+                raise ValueError("Send a number from 1 to 999.")
+            ov = await S.get_cap_override(st["uid"])
+            key = "max_accounts" if st["field"] == "acc" else "max_groups"
+            ov[key] = int(raw)
+            await S.set_cap_override(st["uid"], ov)
+            ctx.user_data.pop("sadm", None)
+            text, rows = await ulim_view(st["uid"], "✅ Saved.")
         elif act == "paylog":
             chat = txt.strip()
             if not chat or len(chat) > 64 or " " in chat:
