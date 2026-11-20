@@ -2245,8 +2245,6 @@ async def group_targets_view(page: int = 0, note: str = ""):
         nav_rows.append(nav)
     nav_rows.append([InlineKeyboardButton("🌐 Use all groups" if gt["mode"] == "selected" else "✅ Use selected only",
                                           callback_data="gt.mode")])
-    if gt["mode"] == "selected":
-        nav_rows.append([InlineKeyboardButton("✅ Select all groups", callback_data="gt.all")])
     nav_rows.append([InlineKeyboardButton(f"🚫 Exclude by link ({len(gt.get('excluded', []))})",
                                           callback_data="gt.ex")])
     nav_rows.append([InlineKeyboardButton("⬅️ Back", callback_data="main:promotion")])
@@ -2342,7 +2340,8 @@ async def group_targets_callback(update, context):
     parts = q.data.split(".")
     act = parts[1] if len(parts) > 1 else "p"
     gt = await load_group_targets()
-    await ensure_group_cache()
+    if act not in ("all", "ex", "exclr"):      # these never need a fresh scan
+        await ensure_group_cache()
     groups = await available_groups()
     limit = (await plan_caps(tenant_id())).get("max_groups")
     if act == "p":
@@ -2375,17 +2374,13 @@ async def group_targets_callback(update, context):
         await save_group_targets(gt)
         text, markup = await group_manage_view(key, page, gt, groups, note)
     elif act == "all":
-        # Select every scanned group in one tap, still within the plan's group limit.
-        keys = list(groups.keys())
-        if limit is not None:
-            keys = keys[:limit]
-        gt["groups"] = {key: {"title": groups[key][1], "accounts": None} for key in keys}
+        # "All groups" covers every account and every group, including ones added later, with no
+        # per-group or per-account picking. Plan limit and exclusions are applied at send time.
+        gt["mode"] = "all"
         await save_group_targets(gt)
-        note = f"✅ {len(keys)} groups selected."
-        if limit is not None and len(groups) > limit:
-            note += f" Plan allows {limit}, so the rest were not selected."
         await q.answer()
-        text, markup = await group_targets_view(0, note)
+        text, markup = await group_targets_view(0, "✅ All groups mode: every account's groups get posts, "
+                                                    "including new accounts and groups. Excluded groups are skipped.")
     elif act == "ex":
         state[q.from_user.id] = "await_group_exclude"
         await q.answer()
@@ -2426,10 +2421,19 @@ async def apply_target_rules(sid: str, groups: list, users: list):
     gt = await load_group_targets()
     excluded = set(gt.get("excluded", []))
     if gt.get("mode") != "selected":
-        # "All groups" mode: everything except the groups the owner excluded by link.
-        if excluded:
-            groups = [(peer, name) for peer, name in groups if group_key(peer) not in excluded]
-        return groups, users
+        # "All groups" mode: every account's groups, minus excluded ones, within the plan's group limit.
+        limit = (await plan_caps(tenant_id())).get("max_groups")
+        allowed = None
+        if limit is not None:
+            ordered = sorted(((k, v[1]) for k, v in (await available_groups()).items()), key=lambda kv: kv[1].lower())
+            allowed = {k for k, _ in ordered[:limit]}
+        out = []
+        for peer, name in groups:
+            key = group_key(peer)
+            if key in excluded or (allowed is not None and key not in allowed):
+                continue
+            out.append((peer, name))
+        return out, users
     limit = (await plan_caps(tenant_id())).get("max_groups")
     keys = list(gt["groups"].keys())
     allowed_keys = set(keys if limit is None else keys[:limit])
