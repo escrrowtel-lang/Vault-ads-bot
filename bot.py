@@ -36,7 +36,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 
 from database import Database, MongoSessionStore
 from pacing import AccountPacer
@@ -2165,26 +2165,31 @@ def _table(headers, rows, widths):
     return "<pre>" + esc("\n".join([head, "-" * len(head)] + body)) + "</pre>"
 
 
-async def ensure_group_cache(timeout: float = 25.0) -> int:
+async def ensure_group_cache(timeout: float = 60.0) -> int:
     """Scan groups for enabled accounts that have no cache yet (e.g. after a restart).
+
+    Accounts are scanned one after another with a short pause, so several accounts do not
+    all hit Telegram at once and freeze the bot. Only accounts without a cache are scanned.
 
     Returns how many accounts are still missing a cache after the attempt.
     """
     rows = await session_store.get_sessions(enabled_only=True)
     missing = [r for r in rows if str(r["id"]) not in target_cache]
+
+    async def _scan_one_by_one():
+        for r in missing:
+            try:
+                client = await get_account_client(r)
+                await get_cached_targets(r, client, force=False)
+            except Exception as exc:
+                log.warning("group scan failed for account %s: %s", r.get("label"), type(exc).__name__)
+            await asyncio.sleep(1.5)
+
     if missing:
-        async def _one(r):
-            client = await get_account_client(r)
-            await get_cached_targets(r, client, force=False)
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*(_one(r) for r in missing), return_exceptions=True),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(_scan_one_by_one(), timeout=timeout)
         except asyncio.TimeoutError:
             log.warning("group cache scan timed out after %ss", timeout)
-        except Exception as exc:
-            log.warning("group cache scan failed: %s", type(exc).__name__)
     return sum(1 for r in rows if str(r["id"]) not in target_cache)
 
 
@@ -2240,6 +2245,10 @@ async def group_targets_view(page: int = 0, note: str = ""):
         nav_rows.append(nav)
     nav_rows.append([InlineKeyboardButton("🌐 Use all groups" if gt["mode"] == "selected" else "✅ Use selected only",
                                           callback_data="gt.mode")])
+    if gt["mode"] == "selected":
+        nav_rows.append([InlineKeyboardButton("✅ Select all groups", callback_data="gt.all")])
+    nav_rows.append([InlineKeyboardButton(f"🚫 Exclude by link ({len(gt.get('excluded', []))})",
+                                          callback_data="gt.ex")])
     nav_rows.append([InlineKeyboardButton("⬅️ Back", callback_data="main:promotion")])
 
     if not names:
@@ -2365,6 +2374,34 @@ async def group_targets_callback(update, context):
             await q.answer()
         await save_group_targets(gt)
         text, markup = await group_manage_view(key, page, gt, groups, note)
+    elif act == "all":
+        # Select every scanned group in one tap, still within the plan's group limit.
+        keys = list(groups.keys())
+        if limit is not None:
+            keys = keys[:limit]
+        gt["groups"] = {key: {"title": groups[key][1], "accounts": None} for key in keys}
+        await save_group_targets(gt)
+        note = f"✅ {len(keys)} groups selected."
+        if limit is not None and len(groups) > limit:
+            note += f" Plan allows {limit}, so the rest were not selected."
+        await q.answer()
+        text, markup = await group_targets_view(0, note)
+    elif act == "ex":
+        state[q.from_user.id] = "await_group_exclude"
+        await q.answer()
+        msg = ("Send the links of groups that should NOT get posts, one per line. "
+               "Each link is checked once; groups are not scanned again.")
+        back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="gt.p.0")],
+                                     [InlineKeyboardButton("🧹 Clear exclusions", callback_data="gt.exclr")]])
+        blocks = [heading("🚫 Exclude groups", 2), para(msg)]
+        text = {"blocks": blocks, "cell_blocks": blocks, "cell_markup": back,
+                "fallback": f"🚫 <b>Exclude groups</b>\n\n{esc(msg)}\n\nCurrently excluded: {len(gt.get('excluded', []))}"}
+        markup = back
+    elif act == "exclr":
+        gt["excluded"] = []
+        await save_group_targets(gt)
+        await q.answer("Exclusions cleared")
+        text, markup = await group_targets_view(0)
     elif act == "a":
         key, sid, page = f"{parts[2]}.{parts[3]}", parts[4], int(parts[5])
         info = gt["groups"].get(key)
@@ -2387,7 +2424,11 @@ async def apply_target_rules(sid: str, groups: list, users: list):
     if (await db.get_setting("dm_broadcast_enabled", "1")) != "1":
         users = []
     gt = await load_group_targets()
+    excluded = set(gt.get("excluded", []))
     if gt.get("mode") != "selected":
+        # "All groups" mode: everything except the groups the owner excluded by link.
+        if excluded:
+            groups = [(peer, name) for peer, name in groups if group_key(peer) not in excluded]
         return groups, users
     limit = (await plan_caps(tenant_id())).get("max_groups")
     keys = list(gt["groups"].keys())
@@ -2395,13 +2436,41 @@ async def apply_target_rules(sid: str, groups: list, users: list):
     out = []
     for peer, name in groups:
         key = group_key(peer)
-        if key not in allowed_keys:
+        if key not in allowed_keys or key in excluded:
             continue
         accounts = gt["groups"][key].get("accounts")
         if accounts is not None and sid not in accounts:
             continue
         out.append((peer, name))
     return out, users
+
+
+async def group_key_for_link(link: str):
+    """Group key a t.me link points to. Resolves only that one link, never scans groups."""
+    parsed = normalize_join_link(link)
+    if not parsed:
+        return None
+    _, _, kind, target = parsed
+    if not target:
+        return None
+    rows = await session_store.get_sessions(enabled_only=True)
+    if not rows:
+        return None
+    client = await get_account_client(rows[0])
+    try:
+        if kind == "invite":
+            res = await client(CheckChatInviteRequest(target))
+            ent = getattr(res, "chat", None)   # present only when a connected account is already in the group
+        else:
+            ent = await client.get_entity(target)
+    except Exception as exc:
+        log.info("exclude link not resolved: %s", type(exc).__name__)
+        return None
+    if isinstance(ent, types.Channel):
+        return f"channel.{ent.id}"
+    if isinstance(ent, types.Chat):
+        return f"chat.{ent.id}"
+    return None
 
 
 async def do_round(app: Application):
@@ -4752,6 +4821,32 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state.pop(uid, None)
             await cleanup_login_flow(uid)
             await context.bot.send_message(uid, f"❌ Login failed:\n<code>{esc(type(e).__name__ + ': ' + str(e))}</code>", parse_mode=ParseMode.HTML, reply_markup=MENU)
+        return
+
+    if current == "await_group_exclude":
+        raw_lines = [line.strip() for line in text.replace(",", "\n").splitlines() if line.strip()]
+        state.pop(uid, None)
+        if not raw_lines:
+            await update.message.reply_text("❌ Send at least one group link.", reply_markup=MENU)
+            return
+        gt = await load_group_targets()
+        excluded = set(gt.get("excluded", []))
+        added, failed = 0, []
+        for raw in raw_lines[:20]:                       # one lookup per link, capped
+            key = await group_key_for_link(raw)
+            if key:
+                excluded.add(key)
+                added += 1
+            else:
+                failed.append(raw)
+        gt["excluded"] = sorted(excluded)
+        await save_group_targets(gt)
+        lines = ["🚫 <b>EXCLUDE UPDATED</b>", f"Excluded now: <b>{added}</b>", f"Total excluded: <b>{len(excluded)}</b>"]
+        if failed:
+            lines.append(f"⚠️ Could not check <b>{len(failed)}</b> link(s). A connected account must already be in that group.")
+        if len(raw_lines) > 20:
+            lines.append("Only the first 20 links were checked.")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MENU)
         return
 
     if current == "await_join_links":
