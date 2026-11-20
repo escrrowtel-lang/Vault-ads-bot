@@ -1899,6 +1899,9 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+_NEWLINE_MARK = ""  # private-use char, never present in post text
+
+
 def saved_html_to_telegram(html_text: str):
     """Saved post HTML -> (plain text, entities) for Telethon.
 
@@ -1913,7 +1916,10 @@ def saved_html_to_telegram(html_text: str):
         nonlocal offset
         if not segment:
             return
-        seg_text, seg_entities = tl_html.parse(segment)
+        # Telethon's HTML parser turns line breaks into spaces. A one-unit placeholder keeps them
+        # intact (same length, so entity offsets stay correct) and is swapped back afterwards.
+        seg_text, seg_entities = tl_html.parse(segment.replace("\n", _NEWLINE_MARK))
+        seg_text = seg_text.replace(_NEWLINE_MARK, "\n")
         for ent in seg_entities or []:
             ent.offset += offset
         entities.extend(seg_entities or [])
