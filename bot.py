@@ -60,6 +60,9 @@ DM_BROADCAST_DELAY_SECONDS = max(30, int(os.getenv("DM_BROADCAST_DELAY_SECONDS",
 DM_REPLY_SEND_GAP_SECONDS = max(2, int(os.getenv("DM_REPLY_SEND_GAP_SECONDS", "5")))
 RESTRICTION_PAUSE_HOURS = max(24, int(os.getenv("RESTRICTION_PAUSE_HOURS", "24")))
 JOIN_QUEUE_INTERVAL_SECONDS = max(300, int(os.getenv("JOIN_QUEUE_INTERVAL_SECONDS", "300")))
+# Max group links per batch sent from the bot: normal users 5, the admin 10.
+JOIN_BATCH_LIMIT_USER = 5
+JOIN_BATCH_LIMIT_ADMIN = 10
 FERNET_KEY = os.environ["FERNET_KEY"].encode()
 fernet = Fernet(FERNET_KEY)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -4772,6 +4775,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=JOIN_GROUPS_MENU,
             )
             return
+        limit = JOIN_BATCH_LIMIT_ADMIN if uid == ADMIN_ID else JOIN_BATCH_LIMIT_USER
+        if len(parsed) > limit:
+            # Whole batch is refused so nothing is queued by accident; the user can resend a smaller list.
+            await update.message.reply_text(
+                f"❌ Ek baar mein maximum <b>{limit}</b> group links bhej sakte hain. "
+                f"Aapne <b>{len(parsed)}</b> bheje hain. Kam links karke dobara bhejiye.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=JOIN_GROUPS_MENU,
+            )
+            return
         rows = await session_store.get_sessions(enabled_only=True)
         if not rows:
             await update.message.reply_text("❌ No active real-user sessions are connected.", reply_markup=ACCOUNTS_MENU)
@@ -5084,7 +5097,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         state[uid] = "await_join_links"
         await update.message.reply_text(
-            "Send Telegram group/channel links now. One per line.\n\n"
+            "Send Telegram group/channel links now. One per line.\n"
+            f"Limit per batch: <b>{JOIN_BATCH_LIMIT_ADMIN if uid == ADMIN_ID else JOIN_BATCH_LIMIT_USER}</b> links.\n\n"
             "Examples:\n"
             "<code>https://t.me/publicgroup</code>\n"
             "<code>@publicgroup</code>\n"
